@@ -450,6 +450,7 @@ class HostServer:
         self.running = False
         self.current_client_sock = None
         self.last_sent_clip = ""
+        self.last_sent_clip_files = []
         self.on_client_connect_cb = None
         self.on_client_disconnect_cb = None
 
@@ -583,6 +584,7 @@ class HostServer:
                             incoming_file = None
                             try:
                                 set_clipboard_files([dest_path])
+                                self.last_sent_clip_files = [dest_path]
                             except Exception:
                                 pass
                             try:
@@ -665,11 +667,21 @@ class HostServer:
             def host_clip_sync():
                 while self.running and self.current_client_sock == client_sock:
                     try:
+                        # 1. Sincronización de Texto
                         cur_txt = get_clipboard_text()
                         if cur_txt and cur_txt != self.last_sent_clip and len(cur_txt) < 500000:
                             self.last_sent_clip = cur_txt
                             tb = cur_txt.encode("utf-8")
                             client_sock.sendall(b"\x01" + struct.pack(">I", len(tb)) + tb)
+
+                        # 2. Sincronización de Archivos (Servidor -> Cliente al hacer Ctrl+C en el Servidor)
+                        cur_files = get_clipboard_files()
+                        if cur_files and cur_files != self.last_sent_clip_files:
+                            self.last_sent_clip_files = list(cur_files)
+                            for fp in cur_files:
+                                if os.path.exists(fp) and os.path.isfile(fp):
+                                    if os.path.getsize(fp) <= 500 * 1024 * 1024:
+                                        self.send_file_to_client(fp)
                     except Exception:
                         break
                     time.sleep(0.5)
@@ -781,7 +793,7 @@ def establish_connection_cascade(sig_client, target_code, cancel_token, update_s
     return None
 
 
-def launch_viewer(sock, password="", target_code="", on_close=None, on_status_msg=None, cancel_token=None):
+def launch_viewer(sock, password="", target_code="", on_connected=None, on_close=None, on_status_msg=None, cancel_token=None):
     import pygame
     from tkinter import filedialog
     import tkinter as tk
@@ -835,6 +847,10 @@ def launch_viewer(sock, password="", target_code="", on_close=None, on_status_ms
         if not dim_data:
             return
         host_w, host_h = struct.unpack(">II", dim_data)
+
+        # La conexión está 100% autorizada y establecida: notificar para ocultar lanzador
+        if on_connected:
+            on_connected()
 
         pygame.init()
         win_w, win_h = min(1280, host_w), min(720, host_h)
@@ -1263,9 +1279,9 @@ def run_gui():
 
         screen_w = root.winfo_screenwidth()
         screen_h = root.winfo_screenheight()
-        w, h = 330, 80
-        x = screen_w - w - 25
-        y = screen_h - h - 65
+        w, h = 380, 88
+        x = screen_w - w - 24
+        y = screen_h - h - 70
         top.geometry(f"{w}x{h}+{x}+{y}")
 
         box = ctk.CTkFrame(
@@ -1274,26 +1290,26 @@ def run_gui():
         box.pack(fill="both", expand=True)
 
         info_frame = ctk.CTkFrame(box, fg_color="transparent")
-        info_frame.pack(side="left", padx=12, pady=10, fill="both", expand=True)
+        info_frame.pack(side="left", padx=(16, 8), pady=12, fill="y")
 
         ctk.CTkLabel(
             info_frame,
             text="● Conexión ODesk Activa",
-            font=ctk.CTkFont(size=12, weight="bold"),
+            font=ctk.CTkFont(size=13, weight="bold"),
             text_color="#10b981",
             anchor="w",
-        ).pack(fill="x")
+        ).pack(anchor="w", pady=(2, 2))
 
         ctk.CTkLabel(
             info_frame,
             text="Control remoto en curso...",
-            font=ctk.CTkFont(size=10),
-            text_color="#94a3b8",
+            font=ctk.CTkFont(size=11, weight="bold"),
+            text_color="#f1f5f9",
             anchor="w",
-        ).pack(fill="x")
+        ).pack(anchor="w")
 
         btn_box = ctk.CTkFrame(box, fg_color="transparent")
-        btn_box.pack(side="right", padx=10, pady=10)
+        btn_box.pack(side="right", padx=(8, 16), pady=12)
 
         def on_send_file():
             def pick():
@@ -1318,9 +1334,9 @@ def run_gui():
         btn_send = ctk.CTkButton(
             btn_box,
             text="📁 Enviar",
-            width=65,
-            height=26,
-            font=ctk.CTkFont(size=10, weight="bold"),
+            width=80,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#2563eb",
             hover_color="#1d4ed8",
             command=on_send_file,
@@ -1330,9 +1346,9 @@ def run_gui():
         btn_end = ctk.CTkButton(
             btn_box,
             text="Finalizar",
-            width=65,
-            height=26,
-            font=ctk.CTkFont(size=10, weight="bold"),
+            width=80,
+            height=28,
+            font=ctk.CTkFont(size=11, weight="bold"),
             fg_color="#ef4444",
             hover_color="#dc2626",
             command=on_end_session,
@@ -1697,8 +1713,9 @@ def run_gui():
 
             root.after(0, lambda: lbl_error.configure(text="Estableciendo sesión remota..."))
 
-            # Ocultar la ventana del lanzador para no estorbar el escritorio
-            root.after(0, root.withdraw)
+            def on_viewer_connected():
+                # Ocultar la ventana del lanzador SOLO cuando la conexión remota fue autorizada
+                root.after(0, root.withdraw)
 
             def on_viewer_close(err):
                 # Restaurar ventana del lanzador al finalizar la sesión
@@ -1716,6 +1733,7 @@ def run_gui():
                 sock,
                 remote_pwd,
                 target_code=target_code,
+                on_connected=on_viewer_connected,
                 on_close=on_viewer_close,
                 on_status_msg=update_status_txt,
                 cancel_token=active_cancel_token,
