@@ -2,9 +2,12 @@
 ODesk - Herramienta de escritorio remoto moderna, ligera y P2P (Python + Rust).
 Diseño visual AnyDesk / RustDesk con CustomTkinter.
 Soporte para:
-- Detección y bloqueo de conexión al propio equipo con mensaje amigable.
+- Conexión Inteligente Multi-Ruta:
+  1. Conexión Directa LAN (Ultra rápida para equipos en la misma red/casa).
+  2. Conexión Directa WAN P2P.
+  3. Puente de Retransmisión (Relay) automático por AWS si el router bloquea puertos.
+- Detección y bloqueo de conexión al propio equipo.
 - Botón de 'Cancelar' interactivo mientras se conecta.
-- Timeouts rápidos y mensajes de error humanos (sin códigos crudos de WinError).
 - Transferencia de archivos bidireccional (Arrastrar y Soltar / Botón F2).
 - Sincronización automática de Portapapeles (Copiar y Pegar texto Ctrl+C / Ctrl+V).
 - Autenticación dual (Contraseña o Autorización interactiva).
@@ -31,6 +34,18 @@ import winsound
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 CF_UNICODETEXT = 13
+
+
+def get_local_lan_ip():
+    """Detecta la IP local de este equipo dentro de la red LAN/WiFi."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 
 def get_clipboard_text():
@@ -147,9 +162,6 @@ def save_config(cfg):
         pass
 
 
-# =====================================================================
-# FALLBACK DE ID DIRECTO
-# =====================================================================
 def id_to_ip_fallback(id_str: str) -> str:
     clean = "".join(c for c in id_str if c.isdigit())
     if len(clean) == 10:
@@ -163,24 +175,28 @@ def id_to_ip_fallback(id_str: str) -> str:
 
 
 # =====================================================================
-# CLIENTE DE SEÑALIZACIÓN (Directorio de IDs)
+# CLIENTE DE SEÑALIZACIÓN Y RELAY (AWS)
 # =====================================================================
 class SignalingClient:
-    def __init__(self, server_addr: str, my_id: str, local_port: int = 5555):
+    def __init__(self, server_addr: str, my_id: str, local_port: int = 5555, on_relay_request=None):
         self.server_addr = server_addr
         self.my_id = "".join(c for c in my_id if c.isdigit())
         self.local_port = local_port
+        self.on_relay_request = on_relay_request
         self.sock = None
         self.connected = False
         self.detected_public_ip = None
         self.stop_event = threading.Event()
 
-    def connect_and_register(self, on_status_change=None):
+    def get_server_host_port(self):
         if ":" in self.server_addr:
-            host, port_s = self.server_addr.split(":", 1)
-            port = int(port_s)
-        else:
-            host, port = self.server_addr, 7000
+            h, p = self.server_addr.split(":", 1)
+            return h, int(p)
+        return self.server_addr, 7000
+
+    def connect_and_register(self, on_status_change=None):
+        host, port = self.get_server_host_port()
+        local_ip = get_local_lan_ip()
 
         while not self.stop_event.is_set():
             try:
@@ -196,6 +212,7 @@ class SignalingClient:
                             "action": "register",
                             "id": self.my_id,
                             "port": self.local_port,
+                            "local_ip": local_ip,
                         }
                     )
                     + "\n"
@@ -211,9 +228,23 @@ class SignalingClient:
                         if on_status_change:
                             on_status_change(True)
 
+                # Bucle de escucha permanente (Pings periódicos y Notificaciones de Relay)
                 while not self.stop_event.is_set():
-                    time.sleep(25)
-                    s.sendall(b'{"action":"ping"}\n')
+                    s.settimeout(30.0)
+                    try:
+                        line = s.makefile().readline()
+                        if not line:
+                            break
+                        msg = json.loads(line.strip())
+                        if msg.get("action") == "incoming_relay":
+                            session_id = msg.get("session_id")
+                            if self.on_relay_request:
+                                threading.Thread(
+                                    target=self.on_relay_request, args=(session_id,), daemon=True
+                                ).start()
+                    except socket.timeout:
+                        # Enviar ping periódico
+                        s.sendall(b'{"action":"ping"}\n')
 
             except Exception:
                 self.connected = False
@@ -230,11 +261,7 @@ class SignalingClient:
 
     def query_peer(self, target_id: str):
         clean_target = "".join(c for c in target_id if c.isdigit())
-        if ":" in self.server_addr:
-            host, port_s = self.server_addr.split(":", 1)
-            port = int(port_s)
-        else:
-            host, port = self.server_addr, 7000
+        host, port = self.get_server_host_port()
 
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -247,10 +274,38 @@ class SignalingClient:
             if resp_line:
                 data = json.loads(resp_line)
                 if data.get("status") == "ok":
-                    return data.get("ip"), data.get("port")
+                    return data
         except Exception:
             pass
-        return None, None
+        return None
+
+    def request_relay_connection(self, target_id: str):
+        """Solicita al servidor de AWS crear un túnel Relay cuando la conexión directa P2P falla."""
+        host, port = self.get_server_host_port()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(6.0)
+            s.connect((host, port))
+            req = json.dumps({"action": "request_relay", "target_id": target_id}) + "\n"
+            s.sendall(req.encode("utf-8"))
+            return s
+        except Exception:
+            return None
+
+    def join_relay_session(self, session_id: str):
+        """Conecta un nuevo socket al servidor de AWS para unirse a la sesión de Relay del Host."""
+        host, port = self.get_server_host_port()
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            s.settimeout(6.0)
+            s.connect((host, port))
+            msg = json.dumps({"action": "join_relay", "session_id": session_id}) + "\n"
+            s.sendall(msg.encode("utf-8"))
+            return s
+        except Exception:
+            return None
 
     def stop(self):
         self.stop_event.set()
@@ -262,7 +317,7 @@ class SignalingClient:
 
 
 # =====================================================================
-# MOTOR RUST Y PROTOCOLO DE STREAMING
+# MOTOR RUST Y PROTOCOLO
 # =====================================================================
 def recv_exact(sock, n):
     buf = bytearray()
@@ -324,6 +379,8 @@ class HostServer:
         self.running = False
         self.current_client_sock = None
         self.last_sent_clip = ""
+        self.on_client_connect_cb = None
+        self.on_client_disconnect_cb = None
 
     def capture_frame(self):
         if self.engine:
@@ -355,13 +412,13 @@ class HostServer:
                     break
                 evt_type = evt_type_raw[0]
 
-                if evt_type == 1:  # Move
+                if evt_type == 1:
                     data = recv_exact(sock, 4)
                     if not data: break
                     x, y = struct.unpack(">HH", data)
                     user32.SetCursorPos(x, y)
 
-                elif evt_type in (2, 3):  # Click
+                elif evt_type in (2, 3):
                     btn_data = recv_exact(sock, 1)
                     if not btn_data: break
                     btn = btn_data[0]
@@ -372,20 +429,20 @@ class HostServer:
                     elif btn == 2: flags = 0x0020 if is_down else 0x0040
                     if flags: user32.mouse_event(flags, 0, 0, 0, 0)
 
-                elif evt_type == 4:  # Wheel
+                elif evt_type == 4:
                     data = recv_exact(sock, 2)
                     if not data: break
                     delta, = struct.unpack(">h", data)
                     user32.mouse_event(0x0800, 0, 0, delta, 0)
 
-                elif evt_type in (5, 6):  # Key
+                elif evt_type in (5, 6):
                     data = recv_exact(sock, 2)
                     if not data: break
                     scancode, = struct.unpack(">H", data)
                     flags = 0x0008 | (0x0002 if evt_type == 6 else 0)
                     user32.keybd_event(0, scancode, flags, 0)
 
-                elif evt_type == 7:  # Portapapeles (Texto Ctrl+V remoto)
+                elif evt_type == 7:
                     len_bytes = recv_exact(sock, 4)
                     if not len_bytes: break
                     txt_len, = struct.unpack(">I", len_bytes)
@@ -395,7 +452,7 @@ class HostServer:
                         self.last_sent_clip = remote_text
                         set_clipboard_text(remote_text)
 
-                elif evt_type == 8:  # Transferencia de Archivo
+                elif evt_type == 8:
                     sub_action = recv_exact(sock, 1)[0]
                     if sub_action == 1:
                         nl = struct.unpack(">H", recv_exact(sock, 2))[0]
@@ -463,8 +520,69 @@ class HostServer:
 
         return False
 
+    def handle_client_session(self, client_sock, addr):
+        """Maneja la sesión de transmisión de un cliente (venga por LAN directa, WAN directa o Relay)."""
+        try:
+            client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+            if not self.authenticate_client(client_sock, addr):
+                client_sock.close()
+                return
+
+            self.current_client_sock = client_sock
+            if self.on_client_connect_cb:
+                self.on_client_connect_cb(addr)
+
+            _, w, h = self.capture_frame()
+            if w == 0:
+                w = user32.GetSystemMetrics(0)
+                h = user32.GetSystemMetrics(1)
+            client_sock.sendall(struct.pack(">II", w, h))
+
+            t_input = threading.Thread(
+                target=self.handle_input, args=(client_sock,), daemon=True
+            )
+            t_input.start()
+
+            def host_clip_sync():
+                while self.running and self.current_client_sock == client_sock:
+                    try:
+                        cur_txt = get_clipboard_text()
+                        if cur_txt and cur_txt != self.last_sent_clip and len(cur_txt) < 500000:
+                            self.last_sent_clip = cur_txt
+                            tb = cur_txt.encode("utf-8")
+                            client_sock.sendall(b"\x01" + struct.pack(">I", len(tb)) + tb)
+                    except Exception:
+                        break
+                    time.sleep(0.5)
+
+            threading.Thread(target=host_clip_sync, daemon=True).start()
+
+            frame_interval = 1.0 / self.target_fps
+            while t_input.is_alive() and self.running:
+                t0 = time.perf_counter()
+                frame_data, _, _ = self.capture_frame()
+                if frame_data:
+                    client_sock.sendall(
+                        b"\x00" + struct.pack(">I", len(frame_data)) + frame_data
+                    )
+
+                delay = frame_interval - (time.perf_counter() - t0)
+                if delay > 0:
+                    time.sleep(delay)
+
+            self.current_client_sock = None
+            if self.on_client_disconnect_cb:
+                self.on_client_disconnect_cb()
+            client_sock.close()
+
+        except Exception:
+            pass
+
     def start(self, on_client_connect=None, on_client_disconnect=None):
         self.running = True
+        self.on_client_connect_cb = on_client_connect
+        self.on_client_disconnect_cb = on_client_disconnect
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
@@ -476,102 +594,79 @@ class HostServer:
         while self.running:
             try:
                 client_sock, addr = server.accept()
-                client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-                if not self.authenticate_client(client_sock, addr):
-                    client_sock.close()
-                    continue
-
-                self.current_client_sock = client_sock
-                if on_client_connect:
-                    on_client_connect(addr)
-
-                _, w, h = self.capture_frame()
-                if w == 0:
-                    w = user32.GetSystemMetrics(0)
-                    h = user32.GetSystemMetrics(1)
-                client_sock.sendall(struct.pack(">II", w, h))
-
-                t_input = threading.Thread(
-                    target=self.handle_input, args=(client_sock,), daemon=True
-                )
-                t_input.start()
-
-                def host_clip_sync():
-                    while self.running and self.current_client_sock == client_sock:
-                        try:
-                            cur_txt = get_clipboard_text()
-                            if cur_txt and cur_txt != self.last_sent_clip and len(cur_txt) < 500000:
-                                self.last_sent_clip = cur_txt
-                                tb = cur_txt.encode("utf-8")
-                                client_sock.sendall(b"\x01" + struct.pack(">I", len(tb)) + tb)
-                        except Exception:
-                            break
-                        time.sleep(0.5)
-
-                threading.Thread(target=host_clip_sync, daemon=True).start()
-
-                frame_interval = 1.0 / self.target_fps
-                while t_input.is_alive() and self.running:
-                    t0 = time.perf_counter()
-                    frame_data, _, _ = self.capture_frame()
-                    if frame_data:
-                        client_sock.sendall(
-                            b"\x00" + struct.pack(">I", len(frame_data)) + frame_data
-                        )
-
-                    delay = frame_interval - (time.perf_counter() - t0)
-                    if delay > 0:
-                        time.sleep(delay)
-
-                self.current_client_sock = None
-                if on_client_disconnect:
-                    on_client_disconnect()
-                client_sock.close()
-
+                threading.Thread(target=self.handle_client_session, args=(client_sock, addr), daemon=True).start()
             except Exception:
                 pass
 
 
 # =====================================================================
-# CLIENTE VISOR CON ARRASTRAR Y SOLTAR + COPIAR/PEGAR + CANCELACIÓN
+# CLIENTE VISOR
 # =====================================================================
-def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=None, cancel_token=None):
+def establish_connection_cascade(sig_client, target_code, cancel_token, update_status_cb):
+    """
+    Algoritmo de Conexión Inteligente Multi-Ruta:
+    1. Si están en la misma red (LAN / WiFi), conecta directo por IP local (ultra veloz).
+    2. Si están en redes diferentes, intenta P2P directo a la IP pública.
+    3. Si el router tiene firewall y no responde, salta automáticamente al túnel Relay de AWS.
+    """
+    clean_target = "".join(c for c in target_code if c.isdigit())
+    peer_info = sig_client.query_peer(clean_target)
+
+    if cancel_token and cancel_token.get("cancelled"):
+        return None
+
+    candidates = []
+    if peer_info:
+        same_net = peer_info.get("same_network", False)
+        local_ip = peer_info.get("local_ip")
+        pub_ip = peer_info.get("public_ip")
+        port = peer_info.get("port", 5555)
+
+        # Si están en la misma red o casa, priorizar IP local
+        if same_net and local_ip:
+            candidates.append((local_ip, port, "LAN Directa"))
+        if pub_ip:
+            candidates.append((pub_ip, port, "WAN Directa"))
+        if local_ip and (local_ip, port, "LAN Directa") not in candidates:
+            candidates.append((local_ip, port, "LAN Directa"))
+    else:
+        direct_ip = id_to_ip_fallback(target_code)
+        if direct_ip:
+            candidates.append((direct_ip, 5555, "P2P Directo"))
+
+    # Intentar candidatos directos
+    for ip, port, desc in candidates:
+        if cancel_token and cancel_token.get("cancelled"):
+            return None
+        try:
+            update_status_cb(f"Conectando vía {desc} ({ip})...")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(2.5)  # Timeout rápido
+            cancel_token["sock"] = sock
+            sock.connect((ip, port))
+            sock.settimeout(None)
+            return sock
+        except Exception:
+            if cancel_token and cancel_token.get("cancelled"):
+                return None
+            continue
+
+    # Si la conexión directa falló (ambos routers bloquean puertos), activar Relay de AWS
+    if peer_info:
+        update_status_cb("Activando túnel seguro ODesk Relay...")
+        relay_sock = sig_client.request_relay_connection(clean_target)
+        if relay_sock:
+            cancel_token["sock"] = relay_sock
+            return relay_sock
+
+    return None
+
+
+def launch_viewer(sock, password="", on_close=None, on_status_msg=None, cancel_token=None):
     import pygame
     from tkinter import filedialog
     import tkinter as tk
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-
-    # Si hay cancel_token, guardar el socket activo para permitir cancelación inmediata
-    if cancel_token is not None:
-        cancel_token["sock"] = sock
-
-    try:
-        sock.settimeout(5.0)  # Timeout rápido en lugar de 21 segundos de Windows
-        sock.connect((host_ip, port))
-        sock.settimeout(None)
-    except Exception as e:
-        sock.close()
-        if cancel_token and cancel_token.get("cancelled"):
-            return
-        # Mensajes de error claros y amigables
-        err_msg = str(e)
-        if "10060" in err_msg or "timed out" in err_msg.lower():
-            err_user = "El equipo remoto no respondió a tiempo.\n\nAsegúrate de que ODesk esté abierto en el otro equipo y con conexión activa."
-        elif "10061" in err_msg or "refused" in err_msg.lower():
-            err_user = "El equipo remoto rechazó la conexión.\n\nVerifica que ODesk esté ejecutándose en el equipo de destino."
-        else:
-            err_user = f"No fue posible establecer conexión con el equipo remoto.\n({err_msg})"
-
-        if on_close:
-            on_close(err_user)
-        return
-
-    if cancel_token and cancel_token.get("cancelled"):
-        sock.close()
-        return
 
     greeting = recv_exact(sock, 5)
     if not greeting or not greeting.startswith(b"ODES"):
@@ -799,7 +894,6 @@ def run_gui():
     root.geometry("780x520")
     root.resizable(False, False)
 
-    # Token de control para cancelar la conexión activa
     active_cancel_token = {"sock": None, "cancelled": False}
     connecting_state = [False]
 
@@ -913,8 +1007,15 @@ def run_gui():
 
     threading.Thread(target=background_upnp, daemon=True).start()
 
-    # 3. Cliente de señalización
-    sig_client = SignalingClient(signal_server_addr, my_id, config["listen_port"])
+    # 3. Callback cuando AWS solicita que este Host atienda una sesión de Relay
+    def on_relay_incoming(session_id):
+        relay_sock = sig_client.join_relay_session(session_id)
+        if relay_sock:
+            # Procesar el socket de relay como si fuera una conexión entrante directa
+            host_server.handle_client_session(relay_sock, ("ODesk-Relay", 7000))
+
+    # 4. Cliente de señalización
+    sig_client = SignalingClient(signal_server_addr, my_id, config["listen_port"], on_relay_request=on_relay_incoming)
 
     def on_signal_status(is_connected):
         if is_connected:
@@ -1142,7 +1243,6 @@ def run_gui():
     )
     lbl_error.pack(pady=0)
 
-    # Función para restaurar el botón de conexión a su estado inicial
     def restore_connect_btn():
         connecting_state[0] = False
         btn_action.configure(
@@ -1152,7 +1252,6 @@ def run_gui():
             state="normal"
         )
 
-    # Cancelar la conexión activa
     def cancel_active_connection():
         active_cancel_token["cancelled"] = True
         if active_cancel_token["sock"]:
@@ -1161,11 +1260,9 @@ def run_gui():
             except Exception:
                 pass
         restore_connect_btn()
-        lbl_error.configure(text="Conexión cancelada por el usuario.")
+        lbl_error.configure(text="Conexión cancelada.")
 
-    # Conectar
     def on_btn_action_clicked():
-        # Si ya se encuentra en proceso de conexión, este botón actúa como CANCELAR
         if connecting_state[0]:
             cancel_active_connection()
             return
@@ -1176,7 +1273,6 @@ def run_gui():
             lbl_error.configure(text="Introduce un código ID.")
             return
 
-        # 1. VALIDACIÓN CRÍTICA: DETECTAR Y BLOQUEAR CONEXIÓN AL PROPIO EQUIPO
         clean_target = "".join(c for c in target_code if c.isdigit())
         clean_my_id = "".join(c for c in my_id if c.isdigit())
 
@@ -1190,7 +1286,6 @@ def run_gui():
             )
             return
 
-        # Activar estado de conexión y cambiar botón a CANCELAR
         connecting_state[0] = True
         active_cancel_token["cancelled"] = False
         active_cancel_token["sock"] = None
@@ -1204,44 +1299,35 @@ def run_gui():
         lbl_error.configure(text="Buscando equipo en Servidor ODesk...")
 
         def resolve_and_connect():
-            target_ip, target_port = sig_client.query_peer(target_code)
+            def update_status_txt(msg):
+                root.after(0, lambda: lbl_error.configure(text=msg))
+
+            # Conexión Inteligente en Cascada (LAN -> WAN P2P -> Relay)
+            sock = establish_connection_cascade(
+                sig_client, target_code, active_cancel_token, update_status_txt
+            )
 
             if active_cancel_token["cancelled"]:
                 return
 
-            if not target_ip:
-                target_ip = id_to_ip_fallback(target_code)
-                target_port = 5555
-
-            if not target_ip:
+            if not sock:
                 root.after(
                     0,
                     lambda: (
                         lbl_error.configure(
-                            text="Equipo no encontrado o fuera de línea."
+                            text="No fue posible conectar con el equipo remoto."
                         ),
-                        restore_connect_btn()
+                        restore_connect_btn(),
+                        messagebox.showerror(
+                            "Aviso ODesk",
+                            "No se pudo conectar con el equipo remoto.\n\n"
+                            "Verifica que el equipo remoto tenga ODesk abierto y activo."
+                        )
                     ),
                 )
                 return
 
-            # También verificar si la IP resuelta es la propia IP local/pública
-            if sig_client.detected_public_ip and target_ip == sig_client.detected_public_ip:
-                # Si coincide la IP y el target ID es el mismo
-                if clean_target == clean_my_id:
-                    root.after(
-                        0,
-                        lambda: (
-                            lbl_error.configure(text="No es posible conectarte a tu propio equipo."),
-                            restore_connect_btn()
-                        )
-                    )
-                    return
-
-            def update_status_txt(msg):
-                root.after(0, lambda: lbl_error.configure(text=msg))
-
-            root.after(0, lambda: lbl_error.configure(text="Conectando con el equipo..."))
+            root.after(0, lambda: lbl_error.configure(text="Estableciendo sesión remota..."))
 
             def on_viewer_close(err):
                 restore_connect_btn()
@@ -1252,8 +1338,7 @@ def run_gui():
                     lbl_error.configure(text="")
 
             launch_viewer(
-                target_ip,
-                target_port,
+                sock,
                 remote_pwd,
                 on_close=on_viewer_close,
                 on_status_msg=update_status_txt,
@@ -1279,7 +1364,7 @@ def run_gui():
 
     lbl_footer_info = ctk.CTkLabel(
         footer_frame,
-        text="ODesk P2P • Transferencia de Archivos y Portapapeles habilitados",
+        text="ODesk P2P • Conexión Inteligente LAN / WAN / Relay",
         font=ctk.CTkFont(size=11),
         text_color="#64748b",
     )
