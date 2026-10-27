@@ -1,0 +1,18 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+
+# Rust build artifacts
+target/
+screen_engine/target/
+
+# Local session config
+odesk_config.json
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
