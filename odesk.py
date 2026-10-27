@@ -816,6 +816,32 @@ class HostServer:
                             daemon=True
                         ).start()
 
+                    elif sub_cmd == 3:
+                        # REQ_CREATE_DIR: Crear nueva carpeta en el Servidor
+                        pp_len_b = recv_exact(sock, 2)
+                        if not pp_len_b: break
+                        pp_len, = struct.unpack(">H", pp_len_b)
+                        pp_b = recv_exact(sock, pp_len) if pp_len > 0 else b""
+                        parent_path = pp_b.decode("utf-8", errors="ignore")
+
+                        fn_len_b = recv_exact(sock, 2)
+                        if not fn_len_b: break
+                        fn_len, = struct.unpack(">H", fn_len_b)
+                        fn_b = recv_exact(sock, fn_len) if fn_len > 0 else b""
+                        new_folder_name = fn_b.decode("utf-8", errors="ignore")
+
+                        try:
+                            new_dir_path = os.path.join(parent_path, new_folder_name)
+                            os.makedirs(new_dir_path, exist_ok=True)
+                            dir_data = self.get_remote_dir_listing(parent_path)
+                            resp_json = json.dumps(dir_data).encode("utf-8")
+                            self.safe_send_client(
+                                b"\x09\x01" + struct.pack(">I", len(resp_json)) + resp_json
+                            )
+                        except Exception as e:
+                            err_b = f"Error al crear carpeta en servidor: {e}".encode("utf-8")
+                            self.safe_send_client(b"\x09\x02" + struct.pack(">H", len(err_b)) + err_b)
+
             except Exception:
                 break
         if incoming_file:
@@ -1032,21 +1058,46 @@ def format_file_size(size_bytes):
         return "--"
 
 
-def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_dir_fn, register_dir_cb_fn):
+def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_dir_fn, register_dir_cb_fn, request_create_dir_fn=None):
     """
     Ventana emergente que permite navegar por el sistema de archivos del servidor remoto.
     mode: 'file' (seleccionar archivo para descargar) o 'folder' (seleccionar carpeta de destino en servidor).
     """
     import customtkinter as ctk
+    from tkinter import messagebox
+
+    # Desactivar temporalmente topmost en la ventana padre para que exp_win quede 100% al frente
+    try:
+        parent_win.attributes("-topmost", False)
+    except Exception:
+        pass
 
     exp_win = ctk.CTkToplevel(parent_win)
     title_text = "Explorador Remoto - " + ("Seleccionar Archivo en Servidor" if mode == "file" else "Seleccionar Carpeta en Servidor")
     exp_win.title(title_text)
-    exp_win.geometry("640x500")
-    exp_win.minsize(580, 440)
-    exp_win.lift()
+    exp_win.geometry("660x520")
+    exp_win.minsize(600, 450)
+    exp_win.transient(parent_win)
     exp_win.attributes("-topmost", True)
+    exp_win.lift(parent_win)
     exp_win.focus_force()
+    try:
+        exp_win.grab_set()
+    except Exception:
+        pass
+
+    def on_close_exp():
+        try:
+            exp_win.grab_release()
+        except Exception:
+            pass
+        exp_win.destroy()
+        if parent_win.winfo_exists():
+            parent_win.attributes("-topmost", True)
+            parent_win.lift()
+            parent_win.focus_force()
+
+    exp_win.protocol("WM_DELETE_WINDOW", on_close_exp)
 
     current_data = {"path": "", "parent": "", "folders": [], "files": [], "selected_file": "", "selected_size": 0, "common": {}, "drives": []}
 
@@ -1068,7 +1119,66 @@ def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_di
     ent_path.bind("<Return>", on_enter_path)
 
     btn_go = ctk.CTkButton(top_bar, text="Ir 🔄", width=60, height=32, command=on_enter_path)
-    btn_go.pack(side="left")
+    btn_go.pack(side="left", padx=(0, 6))
+
+    def on_create_folder_clicked():
+        cur_p = current_data.get("path")
+        if not cur_p or cur_p == "ROOT":
+            return
+
+        exp_win.attributes("-topmost", False)
+        dlg = ctk.CTkToplevel(exp_win)
+        dlg.title("Nueva Carpeta en Servidor")
+        dlg.geometry("380x160")
+        dlg.resizable(False, False)
+        dlg.transient(exp_win)
+        dlg.attributes("-topmost", True)
+        dlg.lift(exp_win)
+        dlg.focus_force()
+        try: dlg.grab_set()
+        except Exception: pass
+
+        lbl_d = ctk.CTkLabel(dlg, text=f"Nueva carpeta en:\n{os.path.basename(cur_p) or cur_p}", font=ctk.CTkFont(size=12, weight="bold"), justify="left")
+        lbl_d.pack(padx=20, pady=(12, 6), anchor="w")
+
+        ent_new_name = ctk.CTkEntry(dlg, placeholder_text="Nombre de la nueva carpeta...", height=34)
+        ent_new_name.pack(fill="x", padx=20, pady=(0, 10))
+        ent_new_name.focus()
+
+        btn_box = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_box.pack(fill="x", padx=20)
+
+        def close_dlg():
+            try: dlg.grab_release()
+            except Exception: pass
+            dlg.destroy()
+            if exp_win.winfo_exists():
+                exp_win.attributes("-topmost", True)
+                exp_win.lift()
+                exp_win.focus_force()
+
+        def do_create(event=None):
+            f_name = ent_new_name.get().strip()
+            if not f_name:
+                return
+            for ch in r'\/:*?"<>|':
+                f_name = f_name.replace(ch, "_")
+            close_dlg()
+            if request_create_dir_fn:
+                request_create_dir_fn(cur_p, f_name)
+
+        ent_new_name.bind("<Return>", do_create)
+
+        b_ok = ctk.CTkButton(btn_box, text="Crear", width=95, height=32, fg_color="#10b981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=do_create)
+        b_ok.pack(side="right", padx=(8, 0))
+
+        b_canc = ctk.CTkButton(btn_box, text="Cancelar", width=85, height=32, fg_color="#475569", hover_color="#334155", command=close_dlg)
+        b_canc.pack(side="right")
+
+        dlg.protocol("WM_DELETE_WINDOW", close_dlg)
+
+    btn_new_f = ctk.CTkButton(top_bar, text="➕ Nueva Carpeta", width=125, height=32, fg_color="#0284c7", hover_color="#0369a1", font=ctk.CTkFont(weight="bold"), command=on_create_folder_clicked)
+    btn_new_f.pack(side="left")
 
     # Fila de accesos rápidos (Unidades y carpetas)
     quick_bar = ctk.CTkFrame(exp_win, fg_color="transparent")
@@ -1097,7 +1207,7 @@ def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_di
     lbl_selected_val = ctk.CTkLabel(bottom_bar, text="Ninguno", font=ctk.CTkFont(size=12), text_color="#38bdf8")
     lbl_selected_val.pack(side="left", fill="x", expand=True)
 
-    btn_cancel = ctk.CTkButton(bottom_bar, text="Cancelar", width=90, fg_color="#4b5563", hover_color="#374151", command=exp_win.destroy)
+    btn_cancel = ctk.CTkButton(bottom_bar, text="Cancelar", width=90, fg_color="#4b5563", hover_color="#374151", command=on_close_exp)
     btn_cancel.pack(side="right", padx=(6, 0))
 
     def on_confirm_selection():
@@ -1106,13 +1216,14 @@ def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_di
             if not sf:
                 return
             full_path = os.path.join(current_data["path"], sf)
-            exp_win.destroy()
-            on_select_callback(full_path, current_data.get("selected_size", 0))
+            sel_sz = current_data.get("selected_size", 0)
+            on_close_exp()
+            on_select_callback(full_path, sel_sz)
         else:
             cp = current_data.get("path")
             if not cp:
                 return
-            exp_win.destroy()
+            on_close_exp()
             on_select_callback(cp, 0)
 
     btn_confirm = ctk.CTkButton(
@@ -1218,7 +1329,7 @@ def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_di
     request_dir_fn("")
 
 
-def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pull_fn, upload_fn, register_callbacks_fn):
+def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pull_fn, upload_fn, register_callbacks_fn, request_create_dir_fn=None):
     """
     Menú principal interactivo de transferencia de archivos con selección clara de Origen y Destino.
     Permite escoger de dónde sacar el archivo (PC Cliente o PC Servidor) y dónde guardarlo (PC Servidor o PC Cliente) y en qué carpeta.
@@ -1228,8 +1339,8 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
 
     top = ctk.CTkToplevel(gui_root)
     top.title(f"ODesk - Transferencia de Archivos [{target_code}]")
-    top.geometry("700x670")
-    top.minsize(660, 620)
+    top.geometry("710x670")
+    top.minsize(680, 620)
     top.lift()
     top.attributes("-topmost", True)
     top.focus_force()
@@ -1288,7 +1399,7 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
 
     rb_src_client = ctk.CTkRadioButton(
         src_selector_frame,
-        text="💻 PC Cliente (Mi equipo local)",
+        text="[PC Cliente]  Mi equipo local",
         variable=src_type_var,
         value="CLIENT",
         command=on_src_radio_change,
@@ -1299,7 +1410,7 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
 
     rb_src_server = ctk.CTkRadioButton(
         src_selector_frame,
-        text="🖥️ PC Servidor (Equipo remoto)",
+        text="[PC Servidor]  Equipo remoto",
         variable=src_type_var,
         value="SERVER",
         command=on_src_radio_change,
@@ -1314,7 +1425,7 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
     ent_src_file = ctk.CTkEntry(src_file_row, placeholder_text="Ningún archivo seleccionado...", height=34)
     ent_src_file.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-    btn_browse_src = ctk.CTkButton(src_file_row, text="📂 Examinar...", width=150, height=34, font=ctk.CTkFont(weight="bold"))
+    btn_browse_src = ctk.CTkButton(src_file_row, text="📂 Examinar mi PC...", width=155, height=34, font=ctk.CTkFont(weight="bold"))
     btn_browse_src.pack(side="right")
 
     src_info_row = ctk.CTkFrame(card_src, fg_color="transparent")
@@ -1348,7 +1459,7 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
 
     rb_dst_server = ctk.CTkRadioButton(
         dst_selector_frame,
-        text="🖥️ PC Servidor (Equipo remoto)",
+        text="[PC Servidor]  Equipo remoto",
         variable=dst_type_var,
         value="SERVER",
         command=on_dst_radio_change,
@@ -1359,7 +1470,7 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
 
     rb_dst_client = ctk.CTkRadioButton(
         dst_selector_frame,
-        text="💻 PC Cliente (Mi equipo local)",
+        text="[PC Cliente]  Mi equipo local",
         variable=dst_type_var,
         value="CLIENT",
         command=on_dst_radio_change,
@@ -1374,8 +1485,19 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
     ent_dst_folder = ctk.CTkEntry(dst_folder_row, placeholder_text="Carpeta de destino donde se guardará...", height=34)
     ent_dst_folder.pack(side="left", fill="x", expand=True, padx=(0, 8))
 
-    btn_browse_dst = ctk.CTkButton(dst_folder_row, text="📁 Elegir Carpeta...", width=150, height=34, font=ctk.CTkFont(weight="bold"))
-    btn_browse_dst.pack(side="right")
+    btn_browse_dst = ctk.CTkButton(dst_folder_row, text="📁 Elegir Carpeta...", width=145, height=34, font=ctk.CTkFont(weight="bold"))
+    btn_browse_dst.pack(side="left", padx=(0, 6))
+
+    btn_create_dst_folder = ctk.CTkButton(
+        dst_folder_row,
+        text="➕ Crear Carpeta",
+        width=125,
+        height=34,
+        font=ctk.CTkFont(weight="bold"),
+        fg_color="#0284c7",
+        hover_color="#0369a1"
+    )
+    btn_create_dst_folder.pack(side="left")
 
     dst_quick_row = ctk.CTkFrame(card_dst, fg_color="transparent")
     dst_quick_row.pack(fill="x", padx=15, pady=(2, 10))
@@ -1437,35 +1559,128 @@ def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pul
     def on_browse_src_clicked():
         st = src_type_var.get()
         if st == "CLIENT":
-            fn = filedialog.askopenfilename(parent=top, title="Seleccionar archivo en este equipo local")
-            if fn:
-                set_src_path(fn)
+            # Desactivar temporalmente topmost para evitar que el diálogo del explorador quede atrás
+            try: top.attributes("-topmost", False)
+            except Exception: pass
+            try:
+                fn = filedialog.askopenfilename(parent=top, title="Seleccionar archivo en este equipo local")
+                if fn:
+                    set_src_path(fn)
+            finally:
+                if top.winfo_exists():
+                    top.attributes("-topmost", True)
+                    top.lift()
+                    top.focus_force()
         else:
             open_remote_explorer_dialog(
                 parent_win=top,
                 mode="file",
                 on_select_callback=lambda fp, sz: set_src_path(fp, sz),
                 request_dir_fn=request_dir_fn,
-                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb)
+                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb),
+                request_create_dir_fn=request_create_dir_fn
             )
 
     def on_browse_dst_clicked():
         dt = dst_type_var.get()
         if dt == "CLIENT":
-            d = filedialog.askdirectory(parent=top, title="Seleccionar carpeta donde guardar en este equipo local")
-            if d:
-                set_dst_path(d)
+            # Desactivar temporalmente topmost para evitar que el diálogo del explorador quede atrás
+            try: top.attributes("-topmost", False)
+            except Exception: pass
+            try:
+                d = filedialog.askdirectory(parent=top, title="Seleccionar carpeta donde guardar en este equipo local")
+                if d:
+                    set_dst_path(d)
+            finally:
+                if top.winfo_exists():
+                    top.attributes("-topmost", True)
+                    top.lift()
+                    top.focus_force()
         else:
             open_remote_explorer_dialog(
                 parent_win=top,
                 mode="folder",
                 on_select_callback=lambda dp, _: set_dst_path(dp),
                 request_dir_fn=request_dir_fn,
-                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb)
+                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb),
+                request_create_dir_fn=request_create_dir_fn
             )
+
+    def on_create_dst_folder_clicked():
+        cur_dst = ent_dst_folder.get().strip()
+        if not cur_dst:
+            messagebox.showwarning("Atención", "Por favor selecciona o escribe primero una carpeta base de destino.", parent=top)
+            return
+
+        try: top.attributes("-topmost", False)
+        except Exception: pass
+
+        dlg = ctk.CTkToplevel(top)
+        dlg.title("Crear Nueva Carpeta")
+        dlg.geometry("380x160")
+        dlg.resizable(False, False)
+        dlg.transient(top)
+        dlg.attributes("-topmost", True)
+        dlg.lift(top)
+        dlg.focus_force()
+        try: dlg.grab_set()
+        except Exception: pass
+
+        disp_p = os.path.basename(cur_dst) or cur_dst
+        lbl_d = ctk.CTkLabel(dlg, text=f"Nueva carpeta dentro de:\n{disp_p}", font=ctk.CTkFont(size=12, weight="bold"), justify="left")
+        lbl_d.pack(padx=20, pady=(12, 6), anchor="w")
+
+        ent_new = ctk.CTkEntry(dlg, placeholder_text="Nombre de la nueva carpeta...", height=34)
+        ent_new.pack(fill="x", padx=20, pady=(0, 10))
+        ent_new.focus()
+
+        btn_box = ctk.CTkFrame(dlg, fg_color="transparent")
+        btn_box.pack(fill="x", padx=20)
+
+        def close_dlg():
+            try: dlg.grab_release()
+            except Exception: pass
+            dlg.destroy()
+            if top.winfo_exists():
+                top.attributes("-topmost", True)
+                top.lift()
+                top.focus_force()
+
+        def do_create(event=None):
+            f_name = ent_new.get().strip()
+            if not f_name:
+                return
+            for ch in r'\/:*?"<>|':
+                f_name = f_name.replace(ch, "_")
+            close_dlg()
+
+            dt = dst_type_var.get()
+            if dt == "CLIENT":
+                try:
+                    new_full = os.path.join(cur_dst, f_name)
+                    os.makedirs(new_full, exist_ok=True)
+                    set_dst_path(new_full)
+                except Exception as ex:
+                    messagebox.showerror("Error", f"No se pudo crear la carpeta local:\n{ex}", parent=top)
+            else:
+                if request_create_dir_fn:
+                    request_create_dir_fn(cur_dst, f_name)
+                new_full = os.path.join(cur_dst, f_name)
+                set_dst_path(new_full)
+
+        ent_new.bind("<Return>", do_create)
+
+        b_ok = ctk.CTkButton(btn_box, text="Crear", width=95, height=32, fg_color="#10b981", hover_color="#059669", font=ctk.CTkFont(weight="bold"), command=do_create)
+        b_ok.pack(side="right", padx=(8, 0))
+
+        b_canc = ctk.CTkButton(btn_box, text="Cancelar", width=85, height=32, fg_color="#475569", hover_color="#334155", command=close_dlg)
+        b_canc.pack(side="right")
+
+        dlg.protocol("WM_DELETE_WINDOW", close_dlg)
 
     btn_browse_src.configure(command=on_browse_src_clicked)
     btn_browse_dst.configure(command=on_browse_dst_clicked)
+    btn_create_dst_folder.configure(command=on_create_dst_folder_clicked)
 
     def update_ui_state():
         st = src_type_var.get()
@@ -1703,6 +1918,15 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
             pb = path.encode("utf-8") if path else b""
             safe_send(b"\x09\x01" + struct.pack(">H", len(pb)) + pb)
 
+        def send_create_dir_request(parent_path, folder_name):
+            pp_b = parent_path.encode("utf-8")
+            fn_b = folder_name.encode("utf-8")
+            safe_send(
+                b"\x09\x03"
+                + struct.pack(">H", len(pp_b)) + pp_b
+                + struct.pack(">H", len(fn_b)) + fn_b
+            )
+
         def send_pull_request(remote_file, local_folder):
             rfp_b = remote_file.encode("utf-8")
             ldd_b = local_folder.encode("utf-8") if local_folder else b""
@@ -1758,7 +1982,8 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     request_dir_fn=send_dir_request,
                     request_pull_fn=send_pull_request,
                     upload_fn=send_upload_file,
-                    register_callbacks_fn=register_ft_callbacks
+                    register_callbacks_fn=register_ft_callbacks,
+                    request_create_dir_fn=send_create_dir_request
                 )
             gui_root.after(0, _open)
 
@@ -2113,14 +2338,12 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
                 s_hover = btn_send_rect.collidepoint(m_pos)
                 pygame.draw.rect(screen, (37, 99, 235) if not s_hover else (29, 78, 216), btn_send_rect, border_radius=5)
-                lbl_btn_s = font_bar.render("📁 Transferir Archivos (F2)", True, (255, 255, 255))
+                lbl_btn_s = font_bar.render("Transferir Archivos (F2)", True, (255, 255, 255))
                 screen.blit(lbl_btn_s, (btn_send_rect.x + (btn_send_rect.w - lbl_btn_s.get_width()) // 2, btn_send_rect.y + 5))
 
                 e_hover = btn_exit_rect.collidepoint(m_pos)
                 pygame.draw.rect(screen, (239, 68, 68) if not e_hover else (220, 38, 38), btn_exit_rect, border_radius=5)
-                lbl_btn_e = font_bar.render("❌ Desconectar", True, (255, 255, 255))
-                screen.blit(lbl_btn_e, (btn_exit_rect.x + (btn_exit_rect.w - lbl_btn_e.get_width()) // 2, btn_exit_rect.y + 5))
-                lbl_btn_e = font_bar.render("❌ Desconectar", True, (255, 255, 255))
+                lbl_btn_e = font_bar.render("Desconectar", True, (255, 255, 255))
                 screen.blit(lbl_btn_e, (btn_exit_rect.x + (btn_exit_rect.w - lbl_btn_e.get_width()) // 2, btn_exit_rect.y + 5))
 
                 # Toast de notificación de transferencia
