@@ -2,6 +2,9 @@
 ODesk - Herramienta de escritorio remoto moderna, ligera y P2P (Python + Rust).
 Diseño visual AnyDesk / RustDesk con CustomTkinter.
 Soporte para:
+- Detección y bloqueo de conexión al propio equipo con mensaje amigable.
+- Botón de 'Cancelar' interactivo mientras se conecta.
+- Timeouts rápidos y mensajes de error humanos (sin códigos crudos de WinError).
 - Transferencia de archivos bidireccional (Arrastrar y Soltar / Botón F2).
 - Sincronización automática de Portapapeles (Copiar y Pegar texto Ctrl+C / Ctrl+V).
 - Autenticación dual (Contraseña o Autorización interactiva).
@@ -31,7 +34,6 @@ CF_UNICODETEXT = 13
 
 
 def get_clipboard_text():
-    """Lee texto del portapapeles de Windows de forma segura."""
     if not user32.OpenClipboard(0):
         return ""
     text = ""
@@ -50,13 +52,12 @@ def get_clipboard_text():
 
 
 def set_clipboard_text(text):
-    """Escribe texto en el portapapeles de Windows."""
     if not text or not user32.OpenClipboard(0):
         return False
     try:
         user32.EmptyClipboard()
         encoded = text.encode("utf-16le") + b"\x00\x00"
-        h_mem = kernel32.GlobalAlloc(0x0042, len(encoded))  # GMEM_MOVEABLE | GMEM_ZEROINIT
+        h_mem = kernel32.GlobalAlloc(0x0042, len(encoded))
         if h_mem:
             p_mem = kernel32.GlobalLock(h_mem)
             if p_mem:
@@ -78,7 +79,6 @@ def is_admin():
 
 
 def ensure_admin():
-    """Fuerza la elevación de privilegios a Administrador para control total (UIPI)."""
     if not is_admin():
         try:
             if getattr(sys, "frozen", False):
@@ -111,7 +111,6 @@ CONFIG_FILE = os.path.join(
     os.environ.get("APPDATA", os.path.dirname(__file__)), "odesk_config.json"
 )
 
-# Servidor ODesk interno por defecto
 DEFAULT_SIGNAL_SERVER = "18.191.199.104:7000"
 
 
@@ -173,6 +172,7 @@ class SignalingClient:
         self.local_port = local_port
         self.sock = None
         self.connected = False
+        self.detected_public_ip = None
         self.stop_event = threading.Event()
 
     def connect_and_register(self, on_status_change=None):
@@ -206,6 +206,7 @@ class SignalingClient:
                 if resp_line:
                     resp = json.loads(resp_line)
                     if resp.get("status") == "ok":
+                        self.detected_public_ip = resp.get("public_ip")
                         self.connected = True
                         if on_status_change:
                             on_status_change(True)
@@ -344,7 +345,6 @@ class HostServer:
         return None, 0, 0
 
     def handle_input(self, sock):
-        """Procesa mouse, teclado, portapapeles y archivos entrantes del Cliente."""
         incoming_file = None
         incoming_file_name = ""
 
@@ -397,13 +397,12 @@ class HostServer:
 
                 elif evt_type == 8:  # Transferencia de Archivo
                     sub_action = recv_exact(sock, 1)[0]
-                    if sub_action == 1:  # Inicio: [name_len (2B)][name][size (8B)]
+                    if sub_action == 1:
                         nl = struct.unpack(">H", recv_exact(sock, 2))[0]
                         incoming_file_name = recv_exact(sock, nl).decode("utf-8", errors="ignore")
-                        _ = struct.unpack(">Q", recv_exact(sock, 8))[0]  # total_size
+                        _ = struct.unpack(">Q", recv_exact(sock, 8))[0]
                         downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
                         dest_path = os.path.join(downloads_dir, incoming_file_name)
-                        # Evitar sobreescribir
                         base, ext = os.path.splitext(dest_path)
                         c = 1
                         while os.path.exists(dest_path):
@@ -411,13 +410,13 @@ class HostServer:
                             c += 1
                         incoming_file = open(dest_path, "wb")
 
-                    elif sub_action == 2:  # Chunk: [len (4B)][bytes]
+                    elif sub_action == 2:
                         chunk_len, = struct.unpack(">I", recv_exact(sock, 4))
                         chunk_bytes = recv_exact(sock, chunk_len)
                         if incoming_file and chunk_bytes:
                             incoming_file.write(chunk_bytes)
 
-                    elif sub_action == 3:  # Fin de archivo
+                    elif sub_action == 3:
                         if incoming_file:
                             incoming_file.close()
                             incoming_file = None
@@ -498,7 +497,6 @@ class HostServer:
                 )
                 t_input.start()
 
-                # Hilo para sincronizar portapapeles del Host hacia el Cliente
                 def host_clip_sync():
                     while self.running and self.current_client_sock == client_sock:
                         try:
@@ -506,7 +504,6 @@ class HostServer:
                             if cur_txt and cur_txt != self.last_sent_clip and len(cur_txt) < 500000:
                                 self.last_sent_clip = cur_txt
                                 tb = cur_txt.encode("utf-8")
-                                # Paquete tipo 1 (Clipboard): [1 (1B)][len (4B)][text]
                                 client_sock.sendall(b"\x01" + struct.pack(">I", len(tb)) + tb)
                         except Exception:
                             break
@@ -519,7 +516,6 @@ class HostServer:
                     t0 = time.perf_counter()
                     frame_data, _, _ = self.capture_frame()
                     if frame_data:
-                        # Paquete tipo 0 (Video): [0 (1B)][len (4B)][JPEG payload]
                         client_sock.sendall(
                             b"\x00" + struct.pack(">I", len(frame_data)) + frame_data
                         )
@@ -538,25 +534,52 @@ class HostServer:
 
 
 # =====================================================================
-# CLIENTE VISOR CON ARRASTRAR Y SOLTAR + COPIAR/PEGAR
+# CLIENTE VISOR CON ARRASTRAR Y SOLTAR + COPIAR/PEGAR + CANCELACIÓN
 # =====================================================================
-def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=None):
+def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=None, cancel_token=None):
     import pygame
     from tkinter import filedialog
     import tkinter as tk
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    # Si hay cancel_token, guardar el socket activo para permitir cancelación inmediata
+    if cancel_token is not None:
+        cancel_token["sock"] = sock
+
     try:
+        sock.settimeout(5.0)  # Timeout rápido en lugar de 21 segundos de Windows
         sock.connect((host_ip, port))
+        sock.settimeout(None)
     except Exception as e:
+        sock.close()
+        if cancel_token and cancel_token.get("cancelled"):
+            return
+        # Mensajes de error claros y amigables
+        err_msg = str(e)
+        if "10060" in err_msg or "timed out" in err_msg.lower():
+            err_user = "El equipo remoto no respondió a tiempo.\n\nAsegúrate de que ODesk esté abierto en el otro equipo y con conexión activa."
+        elif "10061" in err_msg or "refused" in err_msg.lower():
+            err_user = "El equipo remoto rechazó la conexión.\n\nVerifica que ODesk esté ejecutándose en el equipo de destino."
+        else:
+            err_user = f"No fue posible establecer conexión con el equipo remoto.\n({err_msg})"
+
         if on_close:
-            on_close(f"No se pudo conectar a {host_ip}:{port}\n({e})")
+            on_close(err_user)
+        return
+
+    if cancel_token and cancel_token.get("cancelled"):
+        sock.close()
         return
 
     greeting = recv_exact(sock, 5)
     if not greeting or not greeting.startswith(b"ODES"):
         if on_close: on_close("Protocolo no reconocido.")
+        sock.close()
+        return
+
+    if cancel_token and cancel_token.get("cancelled"):
         sock.close()
         return
 
@@ -571,20 +594,21 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
     auth_status = recv_exact(sock, 1)
     if not auth_status:
         sock.close()
-        if on_close: on_close("Conexión cerrada por el servidor.")
+        if on_close and not (cancel_token and cancel_token.get("cancelled")):
+            on_close("Conexión finalizada por el equipo remoto.")
         return
 
     if auth_status == b"\x00":
         sock.close()
-        if on_close: on_close("Contraseña incorrecta. Déjala vacía para solicitar autorización.")
+        if on_close: on_close("Contraseña incorrecta.\n\nPuedes dejarla vacía para solicitar autorización manual al usuario.")
         return
     elif auth_status == b"\x02":
         sock.close()
-        if on_close: on_close("El usuario remoto ha RECHAZADO la solicitud.")
+        if on_close: on_close("El usuario remoto ha RECHAZADO la solicitud de conexión.")
         return
     elif auth_status != b"\x01":
         sock.close()
-        if on_close: on_close("Respuesta no válida.")
+        if on_close: on_close("Respuesta de autorización no válida.")
         return
 
     dim_data = recv_exact(sock, 8)
@@ -606,7 +630,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
     running = True
     last_local_clip = ""
 
-    # Función para enviar archivos por la conexión P2P
     def send_file_p2p(file_path):
         nonlocal transfer_status_msg, transfer_msg_timer
         if not os.path.exists(file_path): return
@@ -618,17 +641,14 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                 transfer_status_msg = f"Enviando archivo: {fn} ({size // 1024} KB)..."
                 transfer_msg_timer = time.time() + 5.0
 
-            # Sub-acción 1: Header [8][1][name_len (2B)][name][size (8B)]
             sock.sendall(b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size))
 
-            # Sub-acción 2: Chunks de 64KB
             with open(file_path, "rb") as f:
                 while running:
                     chunk = f.read(65536)
                     if not chunk: break
                     sock.sendall(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk)
 
-            # Sub-acción 3: Fin
             sock.sendall(b"\x08\x03")
             with lock:
                 transfer_status_msg = f"¡Archivo enviado con éxito a Descargas!: {fn}"
@@ -638,7 +658,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                 transfer_status_msg = f"Error al enviar archivo: {e}"
                 transfer_msg_timer = time.time() + 4.0
 
-    # Hilo receptor multiplexado de video y portapapeles del Host
     def frame_and_clip_receiver():
         nonlocal current_frame, running
         while running:
@@ -658,7 +677,7 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                 except Exception:
                     pass
 
-            elif pkt_type == b"\x01":  # Portapapeles remoto (Ctrl+C en el Host)
+            elif pkt_type == b"\x01":  # Portapapeles remoto
                 len_bytes = recv_exact(sock, 4)
                 if not len_bytes: break
                 txt_len, = struct.unpack(">I", len_bytes)
@@ -672,7 +691,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
     t_recv = threading.Thread(target=frame_and_clip_receiver, daemon=True)
     t_recv.start()
 
-    # Hilo para sincronizar portapapeles del Cliente hacia el Host (Copiar local -> Pegar remoto)
     def client_clip_sync():
         nonlocal last_local_clip
         while running:
@@ -688,7 +706,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
 
     threading.Thread(target=client_clip_sync, daemon=True).start()
 
-    # Bucle principal de Pygame
     font = pygame.font.SysFont("Arial", 16, bold=True)
 
     while running:
@@ -697,12 +714,10 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                 running = False
                 break
 
-            # 1. ARRASTRAR Y SOLTAR ARCHIVOS DIRECTAMENTE EN LA PANTALLA
             elif event.type == pygame.DROPFILE:
                 dropped_file = event.file
                 threading.Thread(target=send_file_p2p, args=(dropped_file,), daemon=True).start()
 
-            # 2. TECLA F2 PARA SELECCIONAR Y ENVIAR ARCHIVO CON VENTANA
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_F2:
                 def pick_and_send():
                     tk_root = tk.Tk()
@@ -741,7 +756,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                     sock.sendall(struct.pack(">BH", 5 if is_down else 6, event.scancode))
                 except OSError: running = False
 
-        # Renderizado de pantalla
         with lock:
             if current_frame:
                 cur_w, cur_h = screen.get_size()
@@ -751,7 +765,6 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=
                 else:
                     screen.blit(current_frame, (0, 0))
 
-            # Notificación visual flotante de transferencia de archivos
             if transfer_status_msg and time.time() < transfer_msg_timer:
                 badge_surf = font.render(transfer_status_msg, True, (255, 255, 255))
                 bg_rect = pygame.Rect(15, 15, badge_surf.get_width() + 20, badge_surf.get_height() + 10)
@@ -786,7 +799,10 @@ def run_gui():
     root.geometry("780x520")
     root.resizable(False, False)
 
-    # Ventana Emergente de Solicitud de Acceso (AnyDesk Knock Style)
+    # Token de control para cancelar la conexión activa
+    active_cancel_token = {"sock": None, "cancelled": False}
+    connecting_state = [False]
+
     def ask_user_permission(client_ip):
         decision_event = threading.Event()
         decision_res = [False]
@@ -1126,18 +1142,72 @@ def run_gui():
     )
     lbl_error.pack(pady=0)
 
-    def on_connect_clicked():
+    # Función para restaurar el botón de conexión a su estado inicial
+    def restore_connect_btn():
+        connecting_state[0] = False
+        btn_action.configure(
+            text="Conectar",
+            fg_color="#10b981",
+            hover_color="#059669",
+            state="normal"
+        )
+
+    # Cancelar la conexión activa
+    def cancel_active_connection():
+        active_cancel_token["cancelled"] = True
+        if active_cancel_token["sock"]:
+            try:
+                active_cancel_token["sock"].close()
+            except Exception:
+                pass
+        restore_connect_btn()
+        lbl_error.configure(text="Conexión cancelada por el usuario.")
+
+    # Conectar
+    def on_btn_action_clicked():
+        # Si ya se encuentra en proceso de conexión, este botón actúa como CANCELAR
+        if connecting_state[0]:
+            cancel_active_connection()
+            return
+
         target_code = entry_id.get().strip()
         remote_pwd = entry_remote_pwd.get().strip()
         if not target_code:
             lbl_error.configure(text="Introduce un código ID.")
             return
 
-        lbl_error.configure(text="Localizando equipo en Servidor ODesk...")
-        btn_connect.configure(state="disabled", text="Buscando...")
+        # 1. VALIDACIÓN CRÍTICA: DETECTAR Y BLOQUEAR CONEXIÓN AL PROPIO EQUIPO
+        clean_target = "".join(c for c in target_code if c.isdigit())
+        clean_my_id = "".join(c for c in my_id if c.isdigit())
+
+        if clean_target == clean_my_id:
+            lbl_error.configure(text="No es posible conectarte a tu propio equipo.")
+            messagebox.showinfo(
+                "Aviso ODesk",
+                "⚠️ Conexión no permitida:\n\n"
+                "Estás intentando conectarte a tu propio puesto de trabajo.\n"
+                "Para controlar otro PC, introduce el código ID del equipo remoto."
+            )
+            return
+
+        # Activar estado de conexión y cambiar botón a CANCELAR
+        connecting_state[0] = True
+        active_cancel_token["cancelled"] = False
+        active_cancel_token["sock"] = None
+
+        btn_action.configure(
+            text="Cancelar",
+            fg_color="#ef4444",
+            hover_color="#dc2626",
+            state="normal"
+        )
+        lbl_error.configure(text="Buscando equipo en Servidor ODesk...")
 
         def resolve_and_connect():
             target_ip, target_port = sig_client.query_peer(target_code)
+
+            if active_cancel_token["cancelled"]:
+                return
 
             if not target_ip:
                 target_ip = id_to_ip_fallback(target_code)
@@ -1150,30 +1220,35 @@ def run_gui():
                         lbl_error.configure(
                             text="Equipo no encontrado o fuera de línea."
                         ),
-                        btn_connect.configure(state="normal", text="Conectar"),
+                        restore_connect_btn()
                     ),
                 )
                 return
 
+            # También verificar si la IP resuelta es la propia IP local/pública
+            if sig_client.detected_public_ip and target_ip == sig_client.detected_public_ip:
+                # Si coincide la IP y el target ID es el mismo
+                if clean_target == clean_my_id:
+                    root.after(
+                        0,
+                        lambda: (
+                            lbl_error.configure(text="No es posible conectarte a tu propio equipo."),
+                            restore_connect_btn()
+                        )
+                    )
+                    return
+
             def update_status_txt(msg):
                 root.after(0, lambda: lbl_error.configure(text=msg))
 
-            root.after(
-                0,
-                lambda: (
-                    lbl_error.configure(text="Conectando..."),
-                    btn_connect.configure(
-                        state="disabled", text="Transmitiendo..."
-                    ),
-                ),
-            )
+            root.after(0, lambda: lbl_error.configure(text="Conectando con el equipo..."))
 
             def on_viewer_close(err):
-                btn_connect.configure(state="normal", text="Conectar")
-                if err:
-                    lbl_error.configure(text=str(err))
+                restore_connect_btn()
+                if err and not active_cancel_token["cancelled"]:
+                    lbl_error.configure(text=str(err).splitlines()[0])
                     messagebox.showerror("Aviso ODesk", err)
-                else:
+                elif not active_cancel_token["cancelled"]:
                     lbl_error.configure(text="")
 
             launch_viewer(
@@ -1182,20 +1257,21 @@ def run_gui():
                 remote_pwd,
                 on_close=on_viewer_close,
                 on_status_msg=update_status_txt,
+                cancel_token=active_cancel_token,
             )
 
         threading.Thread(target=resolve_and_connect, daemon=True).start()
 
-    btn_connect = ctk.CTkButton(
+    btn_action = ctk.CTkButton(
         card_right,
         text="Conectar",
         font=ctk.CTkFont(size=15, weight="bold"),
         fg_color="#10b981",
         hover_color="#059669",
         height=40,
-        command=on_connect_clicked,
+        command=on_btn_action_clicked,
     )
-    btn_connect.pack(fill="x", padx=20, pady=(5, 15))
+    btn_action.pack(fill="x", padx=20, pady=(5, 15))
 
     # ------------------ BARRA INFERIOR LIMPIA ------------------
     footer_frame = ctk.CTkFrame(root, fg_color="transparent")
