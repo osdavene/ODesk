@@ -2,7 +2,8 @@
 ODesk - Herramienta de escritorio remoto moderna, ligera y P2P (Python + Rust).
 Diseño visual estilo AnyDesk / RustDesk con CustomTkinter.
 Soporte para:
-- Autenticación con contraseña (acceso desatendido).
+- Autenticación dual: Contraseña (acceso desatendido) O Autorización manual interactiva.
+- Notificación sonora y ventana emergente de aceptación (Aceptar / Rechazar).
 - Ejecución obligatoria con privilegios de Administrador (Total Control).
 - Integración en binario único .exe sin consola negra de fondo.
 """
@@ -17,6 +18,7 @@ import io
 import json
 import random
 import ctypes
+import winsound
 
 
 # =====================================================================
@@ -34,12 +36,10 @@ def ensure_admin():
     if not is_admin():
         try:
             if getattr(sys, "frozen", False):
-                # Ejecutando como .exe
                 ret = ctypes.windll.shell32.ShellExecuteW(
                     None, "runas", sys.executable, " ".join(sys.argv[1:]), None, 1
                 )
             else:
-                # Ejecutando como script .py
                 params = f'"{os.path.abspath(sys.argv[0])}" ' + " ".join(
                     f'"{arg}"' for arg in sys.argv[1:]
                 )
@@ -70,7 +70,7 @@ def load_or_create_config():
     """Carga o genera una configuración persistente en APPDATA."""
     default_cfg = {
         "device_id": f"{random.randint(100, 999)} {random.randint(100, 999)} {random.randint(100, 999)}",
-        "password": f"{random.randint(100000, 999999)}",  # Contraseña inicial de 6 dígitos
+        "password": f"{random.randint(100000, 999999)}",
         "signal_server": "18.191.199.104:7000",
         "listen_port": 5555,
         "fps": 45,
@@ -227,7 +227,6 @@ def recv_exact(sock, n):
 
 
 def load_rust_engine():
-    # Incluir sys._MEIPASS para cuando esté empaquetado en PyInstaller
     base_dir = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     possible_paths = [
         os.path.join(base_dir, "screen_engine.dll"),
@@ -264,14 +263,15 @@ def load_rust_engine():
 
 
 # =====================================================================
-# SERVIDOR HOST CON AUTENTICACIÓN
+# SERVIDOR HOST CON AUTENTICACIÓN DUAL (Contraseña O Autorización Manual)
 # =====================================================================
 class HostServer:
-    def __init__(self, port=5555, target_fps=45, quality=70, password=""):
+    def __init__(self, port=5555, target_fps=45, quality=70, password="", on_permission_request=None):
         self.port = port
         self.target_fps = target_fps
         self.quality = quality
         self.password = password
+        self.on_permission_request = on_permission_request  # Callback para diálogo interactivo
         self.engine = load_rust_engine()
         self.running = False
         self.user32 = ctypes.windll.user32
@@ -333,7 +333,7 @@ class HostServer:
                     delta, = struct.unpack(">h", data)
                     self.user32.mouse_event(0x0800, 0, 0, delta, 0)
 
-                elif evt_type in (5, 6):  # Key (Hardware Scancode)
+                elif evt_type in (5, 6):  # Key
                     data = recv_exact(sock, 2)
                     if not data:
                         break
@@ -344,13 +344,23 @@ class HostServer:
             except Exception:
                 break
 
-    def authenticate_client(self, client_sock):
-        """Protocolo de autenticación: Verifica la contraseña antes de transmitir video."""
-        # Enviar Magic y flag de contraseña requerida: b"ODES" + [1 if password else 0]
-        req_flag = 1 if self.password else 0
-        client_sock.sendall(b"ODES" + bytes([req_flag]))
+    def authenticate_client(self, client_sock, client_addr):
+        """
+        Protocolo de Autenticación Dual:
+        1. Host envía: b"ODES\x02" (soporte de autenticación dual).
+        2. Cliente envía:
+           - [1 (1B)][len (1B)][password_bytes]: Intento por contraseña.
+           - [2 (1B)]: Solicitud de autorización manual al usuario del Host.
+        """
+        client_sock.sendall(b"ODES\x02")
 
-        if req_flag == 1:
+        auth_type_b = recv_exact(client_sock, 1)
+        if not auth_type_b:
+            return False
+        auth_type = auth_type_b[0]
+
+        # Método 1: Contraseña
+        if auth_type == 1:
             len_byte = recv_exact(client_sock, 1)
             if not len_byte:
                 return False
@@ -360,14 +370,31 @@ class HostServer:
                 return False
             received_pwd = pwd_bytes.decode("utf-8", errors="ignore")
 
-            if received_pwd != self.password:
-                # Fallo de autenticación
+            if received_pwd and received_pwd == self.password:
+                # Contraseña correcta -> Acceso concedido
+                client_sock.sendall(b"\x01")
+                return True
+            else:
+                # Contraseña incorrecta
                 client_sock.sendall(b"\x00")
                 return False
 
-        # Autenticación exitosa
-        client_sock.sendall(b"\x01")
-        return True
+        # Método 2: Solicitud interactiva al usuario del Host
+        elif auth_type == 2:
+            if self.on_permission_request:
+                # Lanzar ventana emergente en el Host y esperar decisión del usuario
+                accepted = self.on_permission_request(client_addr[0])
+                if accepted:
+                    client_sock.sendall(b"\x01")  # Concedido
+                    return True
+                else:
+                    client_sock.sendall(b"\x02")  # Rechazado por el usuario
+                    return False
+            else:
+                client_sock.sendall(b"\x00")
+                return False
+
+        return False
 
     def start(self, on_client_connect=None, on_client_disconnect=None):
         self.running = True
@@ -384,8 +411,7 @@ class HostServer:
                 client_sock, addr = server.accept()
                 client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-                # Validar contraseña del cliente
-                if not self.authenticate_client(client_sock):
+                if not self.authenticate_client(client_sock, addr):
                     client_sock.close()
                     continue
 
@@ -425,9 +451,9 @@ class HostServer:
 
 
 # =====================================================================
-# CLIENTE VISOR (Lanzador Pygame con Autenticación)
+# CLIENTE VISOR (Lanzador Pygame)
 # =====================================================================
-def launch_viewer(host_ip, port=5555, password="", on_close=None):
+def launch_viewer(host_ip, port=5555, password="", on_close=None, on_status_msg=None):
     import pygame
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -439,7 +465,7 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None):
             on_close(f"No se pudo conectar a {host_ip}:{port}\n({e})")
         return
 
-    # 1. Leer saludo y requerimiento de autenticación
+    # 1. Leer saludo del servidor
     greeting = recv_exact(sock, 5)
     if not greeting or not greeting.startswith(b"ODES"):
         if on_close:
@@ -447,21 +473,42 @@ def launch_viewer(host_ip, port=5555, password="", on_close=None):
         sock.close()
         return
 
-    req_flag = greeting[4]
-    if req_flag == 1:
-        # Enviar contraseña: [len (1B)][pwd_bytes]
+    # 2. Enviar autenticación
+    if password:
+        # Enviar método 1: Contraseña [1 (1B)][len (1B)][bytes]
         pwd_bytes = password.encode("utf-8")
-        sock.sendall(bytes([len(pwd_bytes)]) + pwd_bytes)
+        sock.sendall(bytes([1, len(pwd_bytes)]) + pwd_bytes)
+    else:
+        # Enviar método 2: Solicitud interactiva [2 (1B)]
+        if on_status_msg:
+            on_status_msg("Esperando que el usuario remoto acepte la solicitud...")
+        sock.sendall(b"\x02")
 
-    # 2. Leer estado de autenticación (1 byte)
+    # 3. Leer respuesta de autorización
     auth_status = recv_exact(sock, 1)
-    if not auth_status or auth_status != b"\x01":
+    if not auth_status:
         sock.close()
         if on_close:
-            on_close("Contraseña incorrecta. Acceso denegado por el Host.")
+            on_close("El servidor cerró la conexión sin responder.")
         return
 
-    # 3. Leer resolución
+    if auth_status == b"\x00":
+        sock.close()
+        if on_close:
+            on_close("Contraseña incorrecta. Déjala vacía para solicitar autorización manual.")
+        return
+    elif auth_status == b"\x02":
+        sock.close()
+        if on_close:
+            on_close("El usuario remoto ha RECHAZADO tu solicitud de conexión.")
+        return
+    elif auth_status != b"\x01":
+        sock.close()
+        if on_close:
+            on_close("Respuesta de autorización no válida.")
+        return
+
+    # 4. Leer resolución y empezar streaming
     dim_data = recv_exact(sock, 8)
     if not dim_data:
         if on_close:
@@ -579,12 +626,108 @@ def run_gui():
     root.geometry("780x560")
     root.resizable(False, False)
 
+    # Ventana Emergente de Solicitud de Acceso (AnyDesk Knock Style)
+    def ask_user_permission(client_ip):
+        decision_event = threading.Event()
+        decision_res = [False]
+
+        def show_dialog():
+            # Emitir sonido de alerta de Windows
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+
+            top = ctk.CTkToplevel(root)
+            top.title("Solicitud de Control Remoto")
+            top.geometry("420x240")
+            top.resizable(False, False)
+            top.lift()
+            top.attributes("-topmost", True)
+            top.grab_set()
+
+            # Centrar ventana sobre root
+            rx, ry = root.winfo_x(), root.winfo_y()
+            top.geometry(f"+{rx + 180}+{ry + 140}")
+
+            header_dlg = ctk.CTkFrame(top, fg_color="#f59e0b", corner_radius=0, height=36)
+            header_dlg.pack(fill="x")
+            ctk.CTkLabel(
+                header_dlg,
+                text="⚠️ SOLICITUD DE ACCESO ENTRANTE",
+                font=ctk.CTkFont(size=12, weight="bold"),
+                text_color="#000000",
+            ).pack(pady=8)
+
+            msg_frame = ctk.CTkFrame(top, fg_color="transparent")
+            msg_frame.pack(fill="both", expand=True, padx=20, pady=15)
+
+            ctk.CTkLabel(
+                msg_frame,
+                text=f"Un usuario remoto ({client_ip})\nsolicita conectarse a tu pantalla.",
+                font=ctk.CTkFont(size=14, weight="bold"),
+                text_color="#f8fafc",
+                justify="center",
+            ).pack(pady=(5, 10))
+
+            ctk.CTkLabel(
+                msg_frame,
+                text="No proporcionó contraseña. ¿Deseas autorizar el control de este equipo?",
+                font=ctk.CTkFont(size=11),
+                text_color="#94a3b8",
+                justify="center",
+            ).pack()
+
+            btn_frame = ctk.CTkFrame(top, fg_color="transparent")
+            btn_frame.pack(fill="x", padx=20, pady=(0, 20))
+
+            def on_accept():
+                decision_res[0] = True
+                decision_event.set()
+                top.destroy()
+
+            def on_reject():
+                decision_res[0] = False
+                decision_event.set()
+                top.destroy()
+
+            top.protocol("WM_DELETE_WINDOW", on_reject)
+
+            btn_acc = ctk.CTkButton(
+                btn_frame,
+                text="ACEPTAR",
+                fg_color="#10b981",
+                hover_color="#059669",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                height=38,
+                command=on_accept,
+            )
+            btn_acc.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+            btn_rej = ctk.CTkButton(
+                btn_frame,
+                text="RECHAZAR",
+                fg_color="#ef4444",
+                hover_color="#dc2626",
+                font=ctk.CTkFont(size=13, weight="bold"),
+                height=38,
+                command=on_reject,
+            )
+            btn_rej.pack(side="right", fill="x", expand=True, padx=(8, 0))
+
+        root.after(0, show_dialog)
+        # Esperar hasta 35 segundos a que el usuario responda
+        if decision_event.wait(timeout=35.0):
+            return decision_res[0]
+        return False
+
     # 1. Iniciar servidor local
     host_server = HostServer(
         port=config["listen_port"],
         target_fps=config["fps"],
         quality=config["quality"],
         password=config.get("password", "123456"),
+        on_permission_request=ask_user_permission,
     )
     t_host = threading.Thread(target=host_server.start, daemon=True)
     t_host.start()
@@ -674,7 +817,7 @@ def run_gui():
 
     lbl_desc1 = ctk.CTkLabel(
         card_left,
-        text="Comparte tu código permanente y contraseña para acceso remoto.",
+        text="Comparte tu código permanente. Puedes dar tu contraseña o aceptar la solicitud en pantalla.",
         font=ctk.CTkFont(size=11),
         text_color="#94a3b8",
         wraplength=280,
@@ -726,7 +869,7 @@ def run_gui():
 
     lbl_pwd_t = ctk.CTkLabel(
         pwd_frame,
-        text="Contraseña de este equipo:",
+        text="Contraseña (para acceso desatendido):",
         font=ctk.CTkFont(size=11),
         text_color="#94a3b8",
     )
@@ -797,7 +940,7 @@ def run_gui():
 
     lbl_desc2 = ctk.CTkLabel(
         card_right,
-        text="Introduce el código ID del equipo remoto y su contraseña de acceso.",
+        text="Introduce el ID remoto. Si no tienes la contraseña, déjala vacía para solicitar acceso.",
         font=ctk.CTkFont(size=11),
         text_color="#94a3b8",
         wraplength=280,
@@ -816,7 +959,7 @@ def run_gui():
 
     entry_remote_pwd = ctk.CTkEntry(
         card_right,
-        placeholder_text="Contraseña Remota",
+        placeholder_text="Contraseña (Opcional)",
         font=ctk.CTkFont(size=14),
         height=36,
         show="*",
@@ -858,6 +1001,9 @@ def run_gui():
                 )
                 return
 
+            def update_status_txt(msg):
+                root.after(0, lambda: lbl_error.configure(text=msg))
+
             root.after(
                 0,
                 lambda: (
@@ -876,7 +1022,13 @@ def run_gui():
                 else:
                     lbl_error.configure(text="")
 
-            launch_viewer(target_ip, target_port, remote_pwd, on_viewer_close)
+            launch_viewer(
+                target_ip,
+                target_port,
+                remote_pwd,
+                on_close=on_viewer_close,
+                on_status_msg=update_status_txt,
+            )
 
         threading.Thread(target=resolve_and_connect, daemon=True).start()
 
@@ -946,7 +1098,6 @@ def run_gui():
 
 
 def main():
-    # Comprobar privilegios de administrador al iniciar
     ensure_admin()
     run_gui()
 
