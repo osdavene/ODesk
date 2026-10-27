@@ -31,7 +31,7 @@ def load_or_create_config():
     """Carga o genera una configuración persistente con un ID permanente de 9 dígitos."""
     default_cfg = {
         "device_id": f"{random.randint(100, 999)} {random.randint(100, 999)} {random.randint(100, 999)}",
-        "signal_server": "127.0.0.1:7000",  # Cambiar por la IP pública de AWS en producción
+        "signal_server": "18.191.199.104:7000",  # Servidor de señalización en AWS
         "listen_port": 5555,
         "fps": 45,
         "quality": 70,
