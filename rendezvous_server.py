@@ -6,7 +6,7 @@ Funcionalidades:
 2. Detección Inteligente de LAN vs WAN (Intercambio de IP Pública y Local).
 3. Puente de Retransmisión P2P / Relay Fallback:
    Si los routers de ambos equipos tienen NAT estricto o no soportan loopback,
-   el servidor establece un puente de datos transparente entre ambos sockets.
+   el servidor establece un puente de datos bidireccional transparente entre ambos.
 """
 
 import asyncio
@@ -43,6 +43,43 @@ async def pipe_streams(reader: asyncio.StreamReader, writer: asyncio.StreamWrite
             await writer.wait_closed()
         except Exception:
             pass
+
+
+async def wait_and_bridge_relay(session_id, is_host, r, w):
+    """Espera el emparejamiento de ambos sockets y ejecuta el puente bidireccional."""
+    # Esperar hasta 10 segundos a que ambas partes se hayan conectado
+    for _ in range(100):
+        sess = RELAY_SESSIONS.get(session_id)
+        if sess and sess.get("client_r") and sess.get("host_r"):
+            break
+        await asyncio.sleep(0.1)
+
+    sess = RELAY_SESSIONS.get(session_id)
+    if not sess or not sess.get("client_r") or not sess.get("host_r"):
+        logging.warning(f"[RELAY] Timeout de espera para sesión {session_id}")
+        return
+
+    if is_host:
+        # El Host debe permanecer activo en este bucle mientras la sesión exista
+        while session_id in RELAY_SESSIONS:
+            if w.is_closing():
+                break
+            await asyncio.sleep(0.5)
+        return
+
+    # Corrutina del Cliente: ejecuta el puente bidireccional
+    client_r, client_w = sess["client_r"], sess["client_w"]
+    host_r, host_w = sess["host_r"], sess["host_w"]
+
+    try:
+        logging.info(f"[RELAY] Puente de datos activo en sesión {session_id}")
+        await asyncio.gather(
+            pipe_streams(client_r, host_w),
+            pipe_streams(host_r, client_w)
+        )
+    finally:
+        RELAY_SESSIONS.pop(session_id, None)
+        logging.info(f"[RELAY] Sesión {session_id} finalizada.")
 
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -116,14 +153,19 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 writer.write(resp.encode("utf-8"))
                 await writer.drain()
 
-            # 3. Notificación de conexión entrante para activar Relay
+            # 3. Solicitud de Relay por parte del Cliente
             elif msg_type == "request_relay":
                 target_id = "".join(c for c in str(msg.get("target_id", "")) if c.isdigit())
-                session_id = f"relay_{int(time.time()*1000)}_{random_hex(6)}"
+                session_id = f"relay_{int(time.time()*1000)}"
                 peer = REGISTRY.get(target_id)
 
                 if peer and peer.get("writer"):
-                    # Notificar al Host por su socket abierto que se conecte al relay
+                    RELAY_SESSIONS[session_id] = {
+                        "client_r": reader,
+                        "client_w": writer,
+                        "host_r": None,
+                        "host_w": None
+                    }
                     notify_msg = json.dumps({
                         "action": "incoming_relay",
                         "session_id": session_id
@@ -131,19 +173,20 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     try:
                         peer["writer"].write(notify_msg.encode("utf-8"))
                         await peer["writer"].drain()
-                    except Exception:
-                        pass
+                        logging.info(f"[RELAY] Notificación enviada al Host {target_id} para sesión {session_id}")
+                    except Exception as e:
+                        logging.error(f"[RELAY] Error notificando a host: {e}")
+                        writer.write(b'{"status":"error_notifying_host"}\n')
+                        await writer.drain()
+                        return
 
-                    # Guardar sesion de relay
-                    RELAY_SESSIONS[session_id] = {"client_r": reader, "client_w": writer, "host_r": None, "host_w": None}
-                    logging.info(f"[RELAY] Sesión {session_id} creada entre {client_ip} y {target_id}")
-
-                    # Este socket ahora es un túnel de datos (esperar emparejamiento)
+                    # Este socket ahora es el canal del Cliente. Esperar emparejamiento.
                     await wait_and_bridge_relay(session_id, is_host=False, r=reader, w=writer)
                     return
                 else:
                     writer.write(b'{"status":"target_offline"}\n')
                     await writer.drain()
+                    return
 
             # 4. Host uniéndose al Relay
             elif msg_type == "join_relay":
@@ -151,8 +194,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if session_id in RELAY_SESSIONS:
                     RELAY_SESSIONS[session_id]["host_r"] = reader
                     RELAY_SESSIONS[session_id]["host_w"] = writer
-                    logging.info(f"[RELAY] Host emparejado en sesión {session_id}. Iniciando túnel...")
+                    logging.info(f"[RELAY] Host emparejado con éxito en sesión {session_id}. Iniciando túnel...")
                     await wait_and_bridge_relay(session_id, is_host=True, r=reader, w=writer)
+                    return
+                else:
+                    logging.warning(f"[RELAY] Host intentó unirse a sesión inexistente: {session_id}")
                     return
 
             # 5. Ping
@@ -174,41 +220,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await writer.wait_closed()
         except Exception:
             pass
-
-
-def random_hex(n):
-    import secrets
-    return secrets.token_hex(n)
-
-
-async def wait_and_bridge_relay(session_id, is_host, r, w):
-    """Espera a que ambas partes estén conectadas y establece un puente bidireccional transparente."""
-    for _ in range(60):  # Esperar hasta 6 segundos
-        sess = RELAY_SESSIONS.get(session_id)
-        if sess and sess["client_r"] and sess["host_r"]:
-            break
-        await asyncio.sleep(0.1)
-
-    sess = RELAY_SESSIONS.get(session_id)
-    if not sess or not sess["client_r"] or not sess["host_r"]:
-        return
-
-    if is_host:
-        # El hilo del cliente se encargará del puente
-        return
-
-    client_r, client_w = sess["client_r"], sess["client_w"]
-    host_r, host_w = sess["host_r"], sess["host_w"]
-
-    try:
-        # Puente bidireccional
-        await asyncio.gather(
-            pipe_streams(client_r, host_w),
-            pipe_streams(host_r, client_w)
-        )
-    finally:
-        RELAY_SESSIONS.pop(session_id, None)
-        logging.info(f"[RELAY] Sesión {session_id} finalizada.")
 
 
 async def stats_reporter():

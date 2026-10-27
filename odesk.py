@@ -285,10 +285,11 @@ class SignalingClient:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(6.0)
+            s.settimeout(10.0)
             s.connect((host, port))
             req = json.dumps({"action": "request_relay", "target_id": target_id}) + "\n"
             s.sendall(req.encode("utf-8"))
+            s.settimeout(None)
             return s
         except Exception:
             return None
@@ -299,10 +300,11 @@ class SignalingClient:
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            s.settimeout(6.0)
+            s.settimeout(10.0)
             s.connect((host, port))
             msg = json.dumps({"action": "join_relay", "session_id": session_id}) + "\n"
             s.sendall(msg.encode("utf-8"))
+            s.settimeout(None)
             return s
         except Exception:
             return None
@@ -322,10 +324,13 @@ class SignalingClient:
 def recv_exact(sock, n):
     buf = bytearray()
     while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
+        try:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                return None
+            buf.extend(chunk)
+        except Exception:
             return None
-        buf.extend(chunk)
     return bytes(buf)
 
 
@@ -639,10 +644,10 @@ def establish_connection_cascade(sig_client, target_code, cancel_token, update_s
         if cancel_token and cancel_token.get("cancelled"):
             return None
         try:
-            update_status_cb(f"Conectando vía {desc} ({ip})...")
+            update_status_cb(f"Conectando vía {desc}...")
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(2.5)  # Timeout rápido
+            sock.settimeout(2.0)  # Timeout rápido
             cancel_token["sock"] = sock
             sock.connect((ip, port))
             sock.settimeout(None)
@@ -654,7 +659,7 @@ def establish_connection_cascade(sig_client, target_code, cancel_token, update_s
 
     # Si la conexión directa falló (ambos routers bloquean puertos), activar Relay de AWS
     if peer_info:
-        update_status_cb("Activando túnel seguro ODesk Relay...")
+        update_status_cb("Conectando a través de Red ODesk Relay...")
         relay_sock = sig_client.request_relay_connection(clean_target)
         if relay_sock:
             cancel_token["sock"] = relay_sock
@@ -668,211 +673,228 @@ def launch_viewer(sock, password="", on_close=None, on_status_msg=None, cancel_t
     from tkinter import filedialog
     import tkinter as tk
 
-    greeting = recv_exact(sock, 5)
-    if not greeting or not greeting.startswith(b"ODES"):
-        if on_close: on_close("Protocolo no reconocido.")
-        sock.close()
-        return
+    close_notified = False
+    def notify_close(err=None):
+        nonlocal close_notified
+        if not close_notified and on_close:
+            close_notified = True
+            on_close(err)
 
-    if cancel_token and cancel_token.get("cancelled"):
-        sock.close()
-        return
+    try:
+        sock.settimeout(15.0)
+        greeting = recv_exact(sock, 5)
+        if not greeting or not greeting.startswith(b"ODES"):
+            if not (cancel_token and cancel_token.get("cancelled")):
+                notify_close("No se pudo establecer el túnel con el equipo remoto.\n\nVerifica que ODesk esté activo en el otro equipo.")
+            return
 
-    if password:
-        pwd_bytes = password.encode("utf-8")
-        sock.sendall(bytes([1, len(pwd_bytes)]) + pwd_bytes)
-    else:
-        if on_status_msg:
-            on_status_msg("Esperando autorización del usuario remoto...")
-        sock.sendall(b"\x02")
+        if cancel_token and cancel_token.get("cancelled"):
+            return
 
-    auth_status = recv_exact(sock, 1)
-    if not auth_status:
-        sock.close()
-        if on_close and not (cancel_token and cancel_token.get("cancelled")):
-            on_close("Conexión finalizada por el equipo remoto.")
-        return
+        if password:
+            pwd_bytes = password.encode("utf-8")
+            sock.sendall(bytes([1, len(pwd_bytes)]) + pwd_bytes)
+        else:
+            if on_status_msg:
+                on_status_msg("Esperando autorización del usuario remoto...")
+            sock.sendall(b"\x02")
 
-    if auth_status == b"\x00":
-        sock.close()
-        if on_close: on_close("Contraseña incorrecta.\n\nPuedes dejarla vacía para solicitar autorización manual al usuario.")
-        return
-    elif auth_status == b"\x02":
-        sock.close()
-        if on_close: on_close("El usuario remoto ha RECHAZADO la solicitud de conexión.")
-        return
-    elif auth_status != b"\x01":
-        sock.close()
-        if on_close: on_close("Respuesta de autorización no válida.")
-        return
+        sock.settimeout(40.0)
+        auth_status = recv_exact(sock, 1)
+        sock.settimeout(None)
 
-    dim_data = recv_exact(sock, 8)
-    if not dim_data:
-        sock.close()
-        return
-    host_w, host_h = struct.unpack(">II", dim_data)
+        if not auth_status:
+            if not (cancel_token and cancel_token.get("cancelled")):
+                notify_close("Conexión finalizada o rechazada por el equipo remoto.")
+            return
 
-    pygame.init()
-    win_w, win_h = min(1280, host_w), min(720, host_h)
-    screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
-    pygame.display.set_caption("ODesk - Control Remoto P2P (Arrastra archivos o presiona F2)")
-    clock = pygame.time.Clock()
+        if auth_status == b"\x00":
+            notify_close("Contraseña incorrecta.\n\nPuedes dejarla vacía para solicitar autorización manual al usuario.")
+            return
+        elif auth_status == b"\x02":
+            notify_close("El usuario remoto ha RECHAZADO la solicitud de conexión.")
+            return
+        elif auth_status != b"\x01":
+            notify_close("Respuesta de autorización no válida.")
+            return
 
-    current_frame = None
-    transfer_status_msg = ""
-    transfer_msg_timer = 0
-    lock = threading.Lock()
-    running = True
-    last_local_clip = ""
+        dim_data = recv_exact(sock, 8)
+        if not dim_data:
+            return
+        host_w, host_h = struct.unpack(">II", dim_data)
 
-    def send_file_p2p(file_path):
-        nonlocal transfer_status_msg, transfer_msg_timer
-        if not os.path.exists(file_path): return
-        try:
-            fn = os.path.basename(file_path)
-            size = os.path.getsize(file_path)
-            fn_b = fn.encode("utf-8")
-            with lock:
-                transfer_status_msg = f"Enviando archivo: {fn} ({size // 1024} KB)..."
-                transfer_msg_timer = time.time() + 5.0
+        pygame.init()
+        win_w, win_h = min(1280, host_w), min(720, host_h)
+        screen = pygame.display.set_mode((win_w, win_h), pygame.RESIZABLE)
+        pygame.display.set_caption("ODesk - Control Remoto P2P (Arrastra archivos o presiona F2)")
+        clock = pygame.time.Clock()
 
-            sock.sendall(b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size))
+        current_frame = None
+        transfer_status_msg = ""
+        transfer_msg_timer = 0
+        lock = threading.Lock()
+        running = True
+        last_local_clip = ""
 
-            with open(file_path, "rb") as f:
-                while running:
-                    chunk = f.read(65536)
-                    if not chunk: break
-                    sock.sendall(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk)
-
-            sock.sendall(b"\x08\x03")
-            with lock:
-                transfer_status_msg = f"¡Archivo enviado con éxito a Descargas!: {fn}"
-                transfer_msg_timer = time.time() + 4.0
-        except Exception as e:
-            with lock:
-                transfer_status_msg = f"Error al enviar archivo: {e}"
-                transfer_msg_timer = time.time() + 4.0
-
-    def frame_and_clip_receiver():
-        nonlocal current_frame, running
-        while running:
-            pkt_type = recv_exact(sock, 1)
-            if not pkt_type: break
-
-            if pkt_type == b"\x00":  # Video frame
-                len_bytes = recv_exact(sock, 4)
-                if not len_bytes: break
-                frame_len, = struct.unpack(">I", len_bytes)
-                jpeg_bytes = recv_exact(sock, frame_len)
-                if not jpeg_bytes: break
-                try:
-                    surf = pygame.image.load(io.BytesIO(jpeg_bytes), ".jpg")
-                    with lock:
-                        current_frame = surf
-                except Exception:
-                    pass
-
-            elif pkt_type == b"\x01":  # Portapapeles remoto
-                len_bytes = recv_exact(sock, 4)
-                if not len_bytes: break
-                txt_len, = struct.unpack(">I", len_bytes)
-                txt_bytes = recv_exact(sock, txt_len)
-                if txt_bytes:
-                    t_str = txt_bytes.decode("utf-8", errors="ignore")
-                    set_clipboard_text(t_str)
-
-        running = False
-
-    t_recv = threading.Thread(target=frame_and_clip_receiver, daemon=True)
-    t_recv.start()
-
-    def client_clip_sync():
-        nonlocal last_local_clip
-        while running:
+        def send_file_p2p(file_path):
+            nonlocal transfer_status_msg, transfer_msg_timer
+            if not os.path.exists(file_path): return
             try:
-                cur_txt = get_clipboard_text()
-                if cur_txt and cur_txt != last_local_clip and len(cur_txt) < 500000:
-                    last_local_clip = cur_txt
-                    tb = cur_txt.encode("utf-8")
-                    sock.sendall(b"\x07" + struct.pack(">I", len(tb)) + tb)
-            except Exception:
-                break
-            time.sleep(0.5)
+                fn = os.path.basename(file_path)
+                size = os.path.getsize(file_path)
+                fn_b = fn.encode("utf-8")
+                with lock:
+                    transfer_status_msg = f"Enviando archivo: {fn} ({size // 1024} KB)..."
+                    transfer_msg_timer = time.time() + 5.0
 
-    threading.Thread(target=client_clip_sync, daemon=True).start()
+                sock.sendall(b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size))
 
-    font = pygame.font.SysFont("Arial", 16, bold=True)
+                with open(file_path, "rb") as f:
+                    while running:
+                        chunk = f.read(65536)
+                        if not chunk: break
+                        sock.sendall(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk)
 
-    while running:
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                running = False
-                break
+                sock.sendall(b"\x08\x03")
+                with lock:
+                    transfer_status_msg = f"¡Archivo enviado con éxito a Descargas!: {fn}"
+                    transfer_msg_timer = time.time() + 4.0
+            except Exception as e:
+                with lock:
+                    transfer_status_msg = f"Error al enviar archivo: {e}"
+                    transfer_msg_timer = time.time() + 4.0
 
-            elif event.type == pygame.DROPFILE:
-                dropped_file = event.file
-                threading.Thread(target=send_file_p2p, args=(dropped_file,), daemon=True).start()
+        def frame_and_clip_receiver():
+            nonlocal current_frame, running
+            while running:
+                pkt_type = recv_exact(sock, 1)
+                if not pkt_type: break
 
-            elif event.type == pygame.KEYDOWN and event.key == pygame.K_F2:
-                def pick_and_send():
-                    tk_root = tk.Tk()
-                    tk_root.withdraw()
-                    tk_root.attributes("-topmost", True)
-                    selected_file = filedialog.askopenfilename(title="Seleccionar archivo para enviar al equipo remoto")
-                    tk_root.destroy()
-                    if selected_file:
-                        send_file_p2p(selected_file)
-                threading.Thread(target=pick_and_send, daemon=True).start()
+                if pkt_type == b"\x00":  # Video frame
+                    len_bytes = recv_exact(sock, 4)
+                    if not len_bytes: break
+                    frame_len, = struct.unpack(">I", len_bytes)
+                    jpeg_bytes = recv_exact(sock, frame_len)
+                    if not jpeg_bytes: break
+                    try:
+                        surf = pygame.image.load(io.BytesIO(jpeg_bytes), ".jpg")
+                        with lock:
+                            current_frame = surf
+                    except Exception:
+                        pass
 
-            cur_w, cur_h = screen.get_size()
-            scale_x = host_w / cur_w
-            scale_y = host_h / cur_h
+                elif pkt_type == b"\x01":  # Portapapeles remoto
+                    len_bytes = recv_exact(sock, 4)
+                    if not len_bytes: break
+                    txt_len, = struct.unpack(">I", len_bytes)
+                    txt_bytes = recv_exact(sock, txt_len)
+                    if txt_bytes:
+                        t_str = txt_bytes.decode("utf-8", errors="ignore")
+                        set_clipboard_text(t_str)
 
-            if event.type == pygame.MOUSEMOTION:
-                hx = int(event.pos[0] * scale_x)
-                hy = int(event.pos[1] * scale_y)
-                try: sock.sendall(struct.pack(">BHH", 1, hx, hy))
-                except OSError: running = False
+            running = False
 
-            elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
-                is_down = event.type == pygame.MOUSEBUTTONDOWN
-                btn = event.button
+        t_recv = threading.Thread(target=frame_and_clip_receiver, daemon=True)
+        t_recv.start()
+
+        def client_clip_sync():
+            nonlocal last_local_clip
+            while running:
                 try:
-                    if btn in (1, 2, 3):
-                        sock.sendall(struct.pack(">BB", 2 if is_down else 3, btn))
-                    elif btn in (4, 5) and is_down:
-                        delta = 120 if btn == 4 else -120
-                        sock.sendall(struct.pack(">Bh", 4, delta))
-                except OSError: running = False
+                    cur_txt = get_clipboard_text()
+                    if cur_txt and cur_txt != last_local_clip and len(cur_txt) < 500000:
+                        last_local_clip = cur_txt
+                        tb = cur_txt.encode("utf-8")
+                        sock.sendall(b"\x07" + struct.pack(">I", len(tb)) + tb)
+                except Exception:
+                    break
+                time.sleep(0.5)
 
-            elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
-                is_down = event.type == pygame.KEYDOWN
-                try:
-                    sock.sendall(struct.pack(">BH", 5 if is_down else 6, event.scancode))
-                except OSError: running = False
+        threading.Thread(target=client_clip_sync, daemon=True).start()
 
-        with lock:
-            if current_frame:
+        font = pygame.font.SysFont("Arial", 16, bold=True)
+
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                    break
+
+                elif event.type == pygame.DROPFILE:
+                    dropped_file = event.file
+                    threading.Thread(target=send_file_p2p, args=(dropped_file,), daemon=True).start()
+
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_F2:
+                    def pick_and_send():
+                        tk_root = tk.Tk()
+                        tk_root.withdraw()
+                        tk_root.attributes("-topmost", True)
+                        selected_file = filedialog.askopenfilename(title="Seleccionar archivo para enviar al equipo remoto")
+                        tk_root.destroy()
+                        if selected_file:
+                            send_file_p2p(selected_file)
+                    threading.Thread(target=pick_and_send, daemon=True).start()
+
                 cur_w, cur_h = screen.get_size()
-                if (cur_w, cur_h) != (host_w, host_h):
-                    scaled = pygame.transform.smoothscale(current_frame, (cur_w, cur_h))
-                    screen.blit(scaled, (0, 0))
-                else:
-                    screen.blit(current_frame, (0, 0))
+                scale_x = host_w / cur_w
+                scale_y = host_h / cur_h
 
-            if transfer_status_msg and time.time() < transfer_msg_timer:
-                badge_surf = font.render(transfer_status_msg, True, (255, 255, 255))
-                bg_rect = pygame.Rect(15, 15, badge_surf.get_width() + 20, badge_surf.get_height() + 10)
-                pygame.draw.rect(screen, (16, 185, 129), bg_rect, border_radius=6)
-                screen.blit(badge_surf, (25, 20))
+                if event.type == pygame.MOUSEMOTION:
+                    hx = int(event.pos[0] * scale_x)
+                    hy = int(event.pos[1] * scale_y)
+                    try: sock.sendall(struct.pack(">BHH", 1, hx, hy))
+                    except OSError: running = False
 
-        pygame.display.flip()
-        clock.tick(60)
+                elif event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+                    is_down = event.type == pygame.MOUSEBUTTONDOWN
+                    btn = event.button
+                    try:
+                        if btn in (1, 2, 3):
+                            sock.sendall(struct.pack(">BB", 2 if is_down else 3, btn))
+                        elif btn in (4, 5) and is_down:
+                            delta = 120 if btn == 4 else -120
+                            sock.sendall(struct.pack(">Bh", 4, delta))
+                    except OSError: running = False
 
-    sock.close()
-    pygame.quit()
-    if on_close:
-        on_close(None)
+                elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
+                    is_down = event.type == pygame.KEYDOWN
+                    try:
+                        sock.sendall(struct.pack(">BH", 5 if is_down else 6, event.scancode))
+                    except OSError: running = False
+
+            with lock:
+                if current_frame:
+                    cur_w, cur_h = screen.get_size()
+                    if (cur_w, cur_h) != (host_w, host_h):
+                        scaled = pygame.transform.smoothscale(current_frame, (cur_w, cur_h))
+                        screen.blit(scaled, (0, 0))
+                    else:
+                        screen.blit(current_frame, (0, 0))
+
+                if transfer_status_msg and time.time() < transfer_msg_timer:
+                    badge_surf = font.render(transfer_status_msg, True, (255, 255, 255))
+                    bg_rect = pygame.Rect(15, 15, badge_surf.get_width() + 20, badge_surf.get_height() + 10)
+                    pygame.draw.rect(screen, (16, 185, 129), bg_rect, border_radius=6)
+                    screen.blit(badge_surf, (25, 20))
+
+            pygame.display.flip()
+            clock.tick(60)
+
+        notify_close(None)
+
+    except Exception as e:
+        if not (cancel_token and cancel_token.get("cancelled")):
+            notify_close(f"Error en la sesión remota: {e}")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+        try:
+            pygame.quit()
+        except Exception:
+            pass
+        notify_close(None)
 
 
 # =====================================================================
