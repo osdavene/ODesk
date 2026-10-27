@@ -195,10 +195,15 @@ CONFIG_FILE = os.path.join(
 DEFAULT_SIGNAL_SERVER = "18.191.199.104:7000"
 
 
+def generate_random_password():
+    return f"{random.randint(100000, 999999)}"
+
+
 def load_or_create_config():
     default_cfg = {
         "device_id": f"{random.randint(100, 999)} {random.randint(100, 999)} {random.randint(100, 999)}",
-        "password": f"{random.randint(100000, 999999)}",
+        "fixed_password": "",
+        "use_fixed_password": False,
         "signal_server": DEFAULT_SIGNAL_SERVER,
         "listen_port": 5555,
         "fps": 45,
@@ -209,14 +214,19 @@ def load_or_create_config():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
                 default_cfg.update(cfg)
-                return default_cfg
         except Exception:
             pass
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(default_cfg, f, indent=4)
-    except Exception:
-        pass
+
+    # Generar SIEMPRE una nueva contraseña temporal aleatoria para esta ejecución
+    default_cfg["dynamic_password"] = generate_random_password()
+
+    # Si el usuario tiene seleccionada contraseña fija, se usa esa; si no, la dinámica aleatoria
+    if default_cfg.get("use_fixed_password") and default_cfg.get("fixed_password"):
+        default_cfg["active_password"] = default_cfg["fixed_password"]
+    else:
+        default_cfg["active_password"] = default_cfg["dynamic_password"]
+        default_cfg["use_fixed_password"] = False
+
     return default_cfg
 
 
@@ -440,19 +450,32 @@ def load_rust_engine():
 # SERVIDOR HOST
 # =====================================================================
 class HostServer:
-    def __init__(self, port=5555, target_fps=45, quality=70, password="", on_permission_request=None):
+    def __init__(self, port=5555, target_fps=45, quality=70, password="", fixed_password="", on_permission_request=None):
         self.port = port
         self.target_fps = target_fps
         self.quality = quality
         self.password = password
+        self.fixed_password = fixed_password
         self.on_permission_request = on_permission_request
         self.engine = load_rust_engine()
         self.running = False
         self.current_client_sock = None
+        self.sock_send_lock = threading.Lock()
         self.last_sent_clip = ""
         self.last_sent_clip_files = []
         self.on_client_connect_cb = None
         self.on_client_disconnect_cb = None
+
+    def safe_send_client(self, data):
+        """Envío thread-safe al cliente evitando entrelazado de paquetes TCP."""
+        with self.sock_send_lock:
+            if self.current_client_sock:
+                try:
+                    self.current_client_sock.sendall(data)
+                    return True
+                except Exception:
+                    return False
+            return False
 
     def disconnect_current_client(self):
         """Finaliza la sesión del cliente actualmente conectado."""
@@ -471,7 +494,7 @@ class HostServer:
             fn = os.path.basename(file_path)
             size = os.path.getsize(file_path)
             fn_b = fn.encode("utf-8")
-            self.current_client_sock.sendall(
+            self.safe_send_client(
                 b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size)
             )
             with open(file_path, "rb") as f:
@@ -479,10 +502,10 @@ class HostServer:
                     chunk = f.read(65536)
                     if not chunk:
                         break
-                    self.current_client_sock.sendall(
+                    self.safe_send_client(
                         b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk
                     )
-            self.current_client_sock.sendall(b"\x08\x03")
+            self.safe_send_client(b"\x08\x03")
             return True
         except Exception:
             return False
@@ -558,29 +581,56 @@ class HostServer:
                         set_clipboard_text(remote_text)
 
                 elif evt_type == 8:
-                    sub_action = recv_exact(sock, 1)[0]
+                    sub_b = recv_exact(sock, 1)
+                    if not sub_b: break
+                    sub_action = sub_b[0]
+
                     if sub_action == 1:
-                        nl = struct.unpack(">H", recv_exact(sock, 2))[0]
-                        incoming_file_name = recv_exact(sock, nl).decode("utf-8", errors="ignore")
-                        _ = struct.unpack(">Q", recv_exact(sock, 8))[0]
+                        len_b = recv_exact(sock, 2)
+                        if not len_b: break
+                        nl = struct.unpack(">H", len_b)[0]
+                        name_b = recv_exact(sock, nl)
+                        if not name_b: break
+                        incoming_file_name = name_b.decode("utf-8", errors="ignore")
+
+                        size_b = recv_exact(sock, 8)
+                        if not size_b: break
+                        _ = struct.unpack(">Q", size_b)[0]
+
                         downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                        try:
+                            os.makedirs(downloads_dir, exist_ok=True)
+                        except Exception:
+                            pass
                         dest_path = os.path.join(downloads_dir, incoming_file_name)
                         base, ext = os.path.splitext(dest_path)
                         c = 1
                         while os.path.exists(dest_path):
                             dest_path = f"{base}_{c}{ext}"
                             c += 1
-                        incoming_file = open(dest_path, "wb")
+                        try:
+                            incoming_file = open(dest_path, "wb")
+                        except Exception:
+                            incoming_file = None
 
                     elif sub_action == 2:
-                        chunk_len, = struct.unpack(">I", recv_exact(sock, 4))
+                        len_b = recv_exact(sock, 4)
+                        if not len_b: break
+                        chunk_len, = struct.unpack(">I", len_b)
                         chunk_bytes = recv_exact(sock, chunk_len)
-                        if incoming_file and chunk_bytes:
-                            incoming_file.write(chunk_bytes)
+                        if not chunk_bytes: break
+                        if incoming_file:
+                            try:
+                                incoming_file.write(chunk_bytes)
+                            except Exception:
+                                pass
 
                     elif sub_action == 3:
                         if incoming_file:
-                            incoming_file.close()
+                            try:
+                                incoming_file.close()
+                            except Exception:
+                                pass
                             incoming_file = None
                             try:
                                 set_clipboard_files([dest_path])
@@ -603,7 +653,10 @@ class HostServer:
             except Exception:
                 break
         if incoming_file:
-            incoming_file.close()
+            try:
+                incoming_file.close()
+            except Exception:
+                pass
 
     def authenticate_client(self, client_sock, client_addr):
         client_sock.sendall(b"ODES\x02")
@@ -618,7 +671,12 @@ class HostServer:
             pwd_bytes = recv_exact(client_sock, len_byte[0])
             if not pwd_bytes: return False
             received_pwd = pwd_bytes.decode("utf-8", errors="ignore")
-            if received_pwd and received_pwd == self.password:
+            # Aceptar contraseña activa (temporal) o fija predeterminada si existe
+            allowed_pwds = [self.password]
+            if getattr(self, "fixed_password", None):
+                allowed_pwds.append(self.fixed_password)
+
+            if received_pwd and received_pwd in allowed_pwds:
                 client_sock.sendall(b"\x01")
                 return True
             else:
@@ -657,7 +715,7 @@ class HostServer:
             if w == 0:
                 w = user32.GetSystemMetrics(0)
                 h = user32.GetSystemMetrics(1)
-            client_sock.sendall(struct.pack(">II", w, h))
+            self.safe_send_client(struct.pack(">II", w, h))
 
             t_input = threading.Thread(
                 target=self.handle_input, args=(client_sock,), daemon=True
@@ -672,7 +730,7 @@ class HostServer:
                         if cur_txt and cur_txt != self.last_sent_clip and len(cur_txt) < 500000:
                             self.last_sent_clip = cur_txt
                             tb = cur_txt.encode("utf-8")
-                            client_sock.sendall(b"\x01" + struct.pack(">I", len(tb)) + tb)
+                            self.safe_send_client(b"\x01" + struct.pack(">I", len(tb)) + tb)
 
                         # 2. Sincronización de Archivos (Servidor -> Cliente al hacer Ctrl+C en el Servidor)
                         cur_files = get_clipboard_files()
@@ -693,7 +751,7 @@ class HostServer:
                 t0 = time.perf_counter()
                 frame_data, _, _ = self.capture_frame()
                 if frame_data:
-                    client_sock.sendall(
+                    self.safe_send_client(
                         b"\x00" + struct.pack(">I", len(frame_data)) + frame_data
                     )
 
@@ -876,33 +934,76 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
         running = True
         last_local_clip = ""
 
-        def send_file_p2p(file_path):
-            nonlocal transfer_status_msg, transfer_msg_timer
-            if not os.path.exists(file_path): return
-            try:
-                fn = os.path.basename(file_path)
-                size = os.path.getsize(file_path)
-                fn_b = fn.encode("utf-8")
-                with lock:
-                    transfer_status_msg = f"Enviando archivo: {fn} ({size // 1024} KB)..."
-                    transfer_msg_timer = time.time() + 6.0
+        # Candado atómico para envíos por socket (evita entrelazado con movimientos de ratón)
+        sock_send_lock = threading.Lock()
 
-                sock.sendall(b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size))
+        def safe_send(data):
+            with sock_send_lock:
+                try:
+                    sock.sendall(data)
+                    return True
+                except Exception:
+                    return False
 
-                with open(file_path, "rb") as f:
-                    while running:
-                        chunk = f.read(65536)
-                        if not chunk: break
-                        sock.sendall(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk)
+        # Cola de transferencia secuencial de archivos (Cliente -> Servidor)
+        file_send_queue = []
+        file_send_queue_lock = threading.Lock()
+        is_sending_file = False
 
-                sock.sendall(b"\x08\x03")
-                with lock:
-                    transfer_status_msg = f"¡Archivo enviado con éxito a Descargas!: {fn}"
-                    transfer_msg_timer = time.time() + 4.0
-            except Exception as e:
-                with lock:
-                    transfer_status_msg = f"Error al enviar archivo: {e}"
-                    transfer_msg_timer = time.time() + 4.0
+        def process_file_send_queue():
+            nonlocal is_sending_file, transfer_status_msg, transfer_msg_timer
+            while running:
+                target_f = None
+                with file_send_queue_lock:
+                    if file_send_queue:
+                        target_f = file_send_queue.pop(0)
+                    else:
+                        is_sending_file = False
+                        break
+
+                if not target_f or not os.path.exists(target_f):
+                    continue
+
+                try:
+                    fn = os.path.basename(target_f)
+                    size = os.path.getsize(target_f)
+                    fn_b = fn.encode("utf-8")
+                    with lock:
+                        transfer_status_msg = f"Enviando archivo: {fn} ({size // 1024} KB)..."
+                        transfer_msg_timer = time.time() + 8.0
+
+                    # 1. Cabecera (Acción 8, sub-acción 1)
+                    safe_send(b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size))
+
+                    # 2. Envío de fragmentos (Acción 8, sub-acción 2)
+                    with open(target_f, "rb") as f:
+                        while running:
+                            chunk = f.read(65536)
+                            if not chunk:
+                                break
+                            safe_send(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk)
+
+                    # 3. Fin de archivo (Acción 8, sub-acción 3)
+                    safe_send(b"\x08\x03")
+
+                    with lock:
+                        transfer_status_msg = f"¡Archivo enviado con éxito al servidor!: {fn}"
+                        transfer_msg_timer = time.time() + 5.0
+                except Exception as e:
+                    with lock:
+                        transfer_status_msg = f"Error al enviar archivo: {e}"
+                        transfer_msg_timer = time.time() + 4.0
+
+        def queue_file_for_send(file_path):
+            nonlocal is_sending_file
+            if not file_path or not os.path.exists(file_path):
+                return
+            with file_send_queue_lock:
+                if file_path not in file_send_queue:
+                    file_send_queue.append(file_path)
+                if not is_sending_file:
+                    is_sending_file = True
+                    threading.Thread(target=process_file_send_queue, daemon=True).start()
 
         def pick_and_send():
             tk_root = tk.Tk()
@@ -911,7 +1012,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
             selected_files = filedialog.askopenfilenames(title="Seleccionar archivos para transferir al equipo remoto")
             tk_root.destroy()
             for sf in selected_files:
-                send_file_p2p(sf)
+                queue_file_for_send(sf)
 
         def frame_and_clip_receiver():
             nonlocal current_frame, running, transfer_status_msg, transfer_msg_timer
@@ -946,32 +1047,57 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                         set_clipboard_text(t_str)
 
                 elif pkt_type == b"\x08":  # Archivo entrante transferido desde el Host
-                    sub_action = recv_exact(sock, 1)[0]
+                    sub_b = recv_exact(sock, 1)
+                    if not sub_b: break
+                    sub_action = sub_b[0]
+
                     if sub_action == 1:
-                        nl = struct.unpack(">H", recv_exact(sock, 2))[0]
-                        inc_fn = recv_exact(sock, nl).decode("utf-8", errors="ignore")
-                        _ = struct.unpack(">Q", recv_exact(sock, 8))[0]
+                        len_b = recv_exact(sock, 2)
+                        if not len_b: break
+                        nl = struct.unpack(">H", len_b)[0]
+                        name_b = recv_exact(sock, nl)
+                        if not name_b: break
+                        inc_fn = name_b.decode("utf-8", errors="ignore")
+
+                        size_b = recv_exact(sock, 8)
+                        if not size_b: break
+                        _ = struct.unpack(">Q", size_b)[0]
+
                         d_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                        try: os.makedirs(d_dir, exist_ok=True)
+                        except Exception: pass
                         c_dest = os.path.join(d_dir, inc_fn)
                         base, ext = os.path.splitext(c_dest)
                         c = 1
                         while os.path.exists(c_dest):
                             c_dest = f"{base}_{c}{ext}"
                             c += 1
-                        c_inc_file = open(c_dest, "wb")
+                        try:
+                            c_inc_file = open(c_dest, "wb")
+                        except Exception:
+                            c_inc_file = None
                         with lock:
-                            transfer_status_msg = f"Recibiendo archivo: {inc_fn}..."
+                            transfer_status_msg = f"Copiando archivo del servidor: {inc_fn}..."
                             transfer_msg_timer = time.time() + 6.0
 
                     elif sub_action == 2:
-                        c_len, = struct.unpack(">I", recv_exact(sock, 4))
+                        len_b = recv_exact(sock, 4)
+                        if not len_b: break
+                        c_len, = struct.unpack(">I", len_b)
                         c_chunk = recv_exact(sock, c_len)
-                        if c_inc_file and c_chunk:
-                            c_inc_file.write(c_chunk)
+                        if not c_chunk: break
+                        if c_inc_file:
+                            try:
+                                c_inc_file.write(c_chunk)
+                            except Exception:
+                                pass
 
                     elif sub_action == 3:
                         if c_inc_file:
-                            c_inc_file.close()
+                            try:
+                                c_inc_file.close()
+                            except Exception:
+                                pass
                             c_inc_file = None
                             try:
                                 set_clipboard_files([c_dest])
@@ -982,11 +1108,12 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                             except Exception:
                                 pass
                             with lock:
-                                transfer_status_msg = f"¡Archivo guardado en Descargas!: {inc_fn}"
-                                transfer_msg_timer = time.time() + 5.0
+                                transfer_status_msg = f"📋 ¡Archivo copiado del servidor!: {inc_fn} (Listo para Pegar en tu PC)"
+                                transfer_msg_timer = time.time() + 6.0
 
             if c_inc_file:
-                c_inc_file.close()
+                try: c_inc_file.close()
+                except Exception: pass
             running = False
 
         t_recv = threading.Thread(target=frame_and_clip_receiver, daemon=True)
@@ -994,13 +1121,24 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
         def client_clip_sync():
             nonlocal last_local_clip
+            last_client_clip_files = []
             while running:
                 try:
+                    # 1. Sincronización de Texto
                     cur_txt = get_clipboard_text()
                     if cur_txt and cur_txt != last_local_clip and len(cur_txt) < 500000:
                         last_local_clip = cur_txt
                         tb = cur_txt.encode("utf-8")
-                        sock.sendall(b"\x07" + struct.pack(">I", len(tb)) + tb)
+                        safe_send(b"\x07" + struct.pack(">I", len(tb)) + tb)
+
+                    # 2. Sincronización de Archivos al copiar en el Cliente
+                    cur_files = get_clipboard_files()
+                    if cur_files and cur_files != last_client_clip_files:
+                        last_client_clip_files = list(cur_files)
+                        for fp in cur_files:
+                            if os.path.exists(fp) and os.path.isfile(fp):
+                                if os.path.getsize(fp) <= 500 * 1024 * 1024:
+                                    queue_file_for_send(fp)
                 except Exception:
                     break
                 time.sleep(0.5)
@@ -1030,7 +1168,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
                 elif event.type == pygame.DROPFILE:
                     dropped_file = event.file
-                    threading.Thread(target=send_file_p2p, args=(dropped_file,), daemon=True).start()
+                    queue_file_for_send(dropped_file)
 
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_F2:
@@ -1041,7 +1179,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                         clip_files = get_clipboard_files()
                         if clip_files:
                             for cf in clip_files:
-                                threading.Thread(target=send_file_p2p, args=(cf,), daemon=True).start()
+                                queue_file_for_send(cf)
                             continue
 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -1056,10 +1194,10 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     btn = event.button
                     try:
                         if btn in (1, 2, 3):
-                            sock.sendall(struct.pack(">BB", 2, btn))
+                            safe_send(struct.pack(">BB", 2, btn))
                         elif btn in (4, 5):
                             delta = 120 if btn == 4 else -120
-                            sock.sendall(struct.pack(">Bh", 4, delta))
+                            safe_send(struct.pack(">Bh", 4, delta))
                     except OSError:
                         running = False
 
@@ -1069,7 +1207,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     btn = event.button
                     try:
                         if btn in (1, 2, 3):
-                            sock.sendall(struct.pack(">BB", 3, btn))
+                            safe_send(struct.pack(">BB", 3, btn))
                     except OSError:
                         running = False
 
@@ -1079,14 +1217,14 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     hx = int(event.pos[0] * scale_x)
                     hy = int(event.pos[1] * scale_y)
                     try:
-                        sock.sendall(struct.pack(">BHH", 1, hx, hy))
+                        safe_send(struct.pack(">BHH", 1, hx, hy))
                     except OSError:
                         running = False
 
                 elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
                     is_down = event.type == pygame.KEYDOWN
                     try:
-                        sock.sendall(struct.pack(">BH", 5 if is_down else 6, event.scancode))
+                        safe_send(struct.pack(">BH", 5 if is_down else 6, event.scancode))
                     except OSError:
                         running = False
 
@@ -1368,7 +1506,8 @@ def run_gui():
         port=config["listen_port"],
         target_fps=config["fps"],
         quality=config["quality"],
-        password=config.get("password", "123456"),
+        password=config["active_password"],
+        fixed_password=config.get("fixed_password", ""),
         on_permission_request=ask_user_permission,
     )
     t_host = threading.Thread(
@@ -1524,23 +1663,48 @@ def run_gui():
 
     lbl_pwd_t = ctk.CTkLabel(
         pwd_frame,
-        text="Contraseña (para acceso desatendido):",
-        font=ctk.CTkFont(size=11),
+        text="Contraseña de este puesto:",
+        font=ctk.CTkFont(size=11, weight="bold"),
         text_color="#94a3b8",
     )
-    lbl_pwd_t.pack(anchor="w", padx=12, pady=(8, 2))
+    lbl_pwd_t.pack(anchor="w", padx=12, pady=(6, 2))
 
     pwd_subframe = ctk.CTkFrame(pwd_frame, fg_color="transparent")
-    pwd_subframe.pack(fill="x", padx=12, pady=(0, 8))
+    pwd_subframe.pack(fill="x", padx=12, pady=(0, 4))
 
     entry_my_pwd = ctk.CTkEntry(
         pwd_subframe,
-        font=ctk.CTkFont(family="Consolas", size=13),
-        height=30,
-        show="*",
+        font=ctk.CTkFont(family="Consolas", size=13, weight="bold"),
+        height=32,
+        show="",
     )
-    entry_my_pwd.insert(0, config.get("password", "123456"))
-    entry_my_pwd.pack(side="left", fill="x", expand=True, padx=(0, 6))
+    entry_my_pwd.insert(0, config["active_password"])
+    entry_my_pwd.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+    def on_refresh_dynamic_pwd():
+        new_dyn = generate_random_password()
+        config["dynamic_password"] = new_dyn
+        if not chk_fixed_var.get():
+            config["active_password"] = new_dyn
+            host_server.password = new_dyn
+            entry_my_pwd.delete(0, "end")
+            entry_my_pwd.insert(0, new_dyn)
+            lbl_pwd_status.configure(
+                text="● Nueva contraseña temporal generada",
+                text_color="#38bdf8",
+            )
+
+    btn_refresh = ctk.CTkButton(
+        pwd_subframe,
+        text="🔄",
+        width=34,
+        height=32,
+        font=ctk.CTkFont(size=13),
+        fg_color="#334155",
+        hover_color="#475569",
+        command=on_refresh_dynamic_pwd,
+    )
+    btn_refresh.pack(side="left", padx=(0, 4))
 
     def toggle_show_pwd():
         if entry_my_pwd.cget("show") == "*":
@@ -1552,34 +1716,106 @@ def run_gui():
 
     btn_show_pwd = ctk.CTkButton(
         pwd_subframe,
-        text="Ver",
-        width=55,
-        height=30,
+        text="Ocultar",
+        width=58,
+        height=32,
         fg_color="#334155",
+        hover_color="#475569",
         command=toggle_show_pwd,
     )
     btn_show_pwd.pack(side="left", padx=(0, 4))
 
-    def save_new_password():
-        new_p = entry_my_pwd.get().strip()
-        config["password"] = new_p
-        host_server.password = new_p
-        save_config(config)
-        btn_save_pwd.configure(text="OK!", fg_color="#059669")
-        root.after(
-            1500,
-            lambda: btn_save_pwd.configure(text="Guardar", fg_color="#334155"),
+    def on_save_fixed():
+        new_val = entry_my_pwd.get().strip()
+        if not new_val:
+            return
+        config["fixed_password"] = new_val
+        config["use_fixed_password"] = True
+        config["active_password"] = new_val
+        host_server.password = new_val
+        host_server.fixed_password = new_val
+        chk_fixed_var.set(True)
+        save_config({
+            "device_id": config["device_id"],
+            "fixed_password": new_val,
+            "use_fixed_password": True,
+            "signal_server": config.get("signal_server", DEFAULT_SIGNAL_SERVER),
+            "listen_port": config.get("listen_port", 5555),
+            "fps": config.get("fps", 45),
+            "quality": config.get("quality", 70),
+        })
+        lbl_pwd_status.configure(
+            text="✓ Contraseña fija guardada en odesk_config.json",
+            text_color="#10b981",
         )
+        btn_save_pwd.configure(text="¡OK!", fg_color="#059669")
+        root.after(1500, lambda: btn_save_pwd.configure(text="Guardar", fg_color="#2563eb"))
 
     btn_save_pwd = ctk.CTkButton(
         pwd_subframe,
         text="Guardar",
-        width=60,
-        height=30,
-        fg_color="#334155",
-        command=save_new_password,
+        width=62,
+        height=32,
+        fg_color="#2563eb",
+        hover_color="#1d4ed8",
+        command=on_save_fixed,
     )
     btn_save_pwd.pack(side="left")
+
+    def on_toggle_fixed():
+        is_fixed = chk_fixed_var.get()
+        config["use_fixed_password"] = is_fixed
+        if is_fixed:
+            fixed_val = config.get("fixed_password", "") or entry_my_pwd.get().strip()
+            config["fixed_password"] = fixed_val
+            config["active_password"] = fixed_val
+            host_server.password = fixed_val
+            host_server.fixed_password = fixed_val
+            entry_my_pwd.delete(0, "end")
+            entry_my_pwd.insert(0, fixed_val)
+            lbl_pwd_status.configure(
+                text="✓ Contraseña fija activa (guardada en config)",
+                text_color="#10b981",
+            )
+        else:
+            dyn_val = generate_random_password()
+            config["dynamic_password"] = dyn_val
+            config["active_password"] = dyn_val
+            host_server.password = dyn_val
+            entry_my_pwd.delete(0, "end")
+            entry_my_pwd.insert(0, dyn_val)
+            lbl_pwd_status.configure(
+                text="● Contraseña temporal (cambia en cada inicio)",
+                text_color="#38bdf8",
+            )
+        save_config({
+            "device_id": config["device_id"],
+            "fixed_password": config.get("fixed_password", ""),
+            "use_fixed_password": is_fixed,
+            "signal_server": config.get("signal_server", DEFAULT_SIGNAL_SERVER),
+            "listen_port": config.get("listen_port", 5555),
+            "fps": config.get("fps", 45),
+            "quality": config.get("quality", 70),
+        })
+
+    chk_fixed_var = ctk.BooleanVar(value=config.get("use_fixed_password", False))
+    chk_fixed = ctk.CTkCheckBox(
+        pwd_frame,
+        text="Predeterminada fija (guardar en config)",
+        variable=chk_fixed_var,
+        font=ctk.CTkFont(size=11),
+        text_color="#cbd5e1",
+        command=on_toggle_fixed,
+    )
+    chk_fixed.pack(anchor="w", padx=12, pady=(2, 2))
+
+    lbl_pwd_status = ctk.CTkLabel(
+        pwd_frame,
+        text="✓ Contraseña fija guardada en odesk_config.json" if config.get("use_fixed_password") else "● Contraseña temporal (cambia en cada inicio)",
+        font=ctk.CTkFont(size=10, weight="bold"),
+        text_color="#10b981" if config.get("use_fixed_password") else "#38bdf8",
+    )
+    lbl_pwd_status.pack(anchor="w", padx=12, pady=(0, 6))
 
     # Tarjeta Derecha: Control Remoto
     card_right = ctk.CTkFrame(main_frame, corner_radius=12, fg_color="#1e1e2e")
