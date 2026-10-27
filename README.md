@@ -1,54 +1,49 @@
 # ODesk - Escritorio Remoto Híbrido P2P (Windows)
 
-Herramienta de escritorio remoto punto a punto, moderna, ligera y de alto rendimiento.
-Desarrollada con una arquitectura híbrida de **Rust** (captura y compresión SIMD) y **Python** (interfaz gráfica moderna con CustomTkinter y orquestación de red).
+Herramienta de escritorio remoto punto a punto (P2P), moderna, ultraligera y de alto rendimiento.
+Desarrollada con una arquitectura híbrida de **Rust** (captura GDI y compresión JPEG SIMD) y **Python** (interfaz gráfica moderna con CustomTkinter y orquestación de red).
 
 ---
 
-## 🎨 Aspecto Visual y Funcionamiento
+## 🚀 Novedades y Características
 
-ODesk cuenta con una interfaz gráfica moderna con modo oscuro inspirada en **AnyDesk** y **RustDesk**:
-
-- **Este Puesto de Trabajo (Tu ID):** Genera automáticamente un código estilizado de 10 dígitos (ej. `168 329 5266`) asociado a tu equipo, con botón de **Copiar Código**.
-- **Servidor en Segundo Plano:** El equipo queda listo para recibir conexiones inmediatamente al abrir la aplicación (indicador verde `● Listo para recibir conexiones`).
-- **Control Remoto:** Introduce el código ID del otro equipo y presiona **Conectar**.
+- **Sin consola negra (Windowed):** Empaquetado en un único ejecutable [`ODesk.exe`](file:///c:/Proyectos/ODesk/ODesk.exe) sin ventana de terminal de fondo.
+- **Modo Administrador Automático (UAC):** Solicita permisos de Administrador al inicio mediante su manifiesto para eludir la restricción **UIPI (User Interface Privilege Isolation)** de Windows. Permite interactuar con:
+  - Ventanas elevadas (CMD como Admin, PowerShell, etc.).
+  - Administrador de Tareas (*Task Manager*).
+  - Instaladores y diálogos de configuración del sistema.
+- **Acceso Desatendido con Contraseña:** Puedes configurar tu propia contraseña o usar la generada automáticamente para permitir el acceso remoto seguro sin intervención física.
+- **Señalizador WAN en AWS de Costo Cero:** Conexión a través de tu instancia EC2 (`18.191.199.104:7000`) consumiendo menos de 2 MB de RAM y cero costo de ancho de banda (el video es 100% P2P directo).
 
 ---
 
-## 💡 ¿Por qué no genera costos en AWS?
+## 🎨 Aspecto de la Interfaz
 
-En herramientas comerciales, los servidores en la nube son necesarios principalmente para:
-1. **Señalización (Intercambiar IDs):** Consume solo ~500 bytes por conexión.
-2. **Relay (Retransmitir el video por la nube):** Consume ~1.5 GB por hora por usuario. Si pasa por AWS, el costo de transferencia de datos (*Data Transfer Out*) sería elevado.
-
-### La Solución de ODesk: "ID Cero Servidor"
-ODesk mapea matemáticamente las direcciones IPv4 (locales o de red segura **Tailscale**) a un código numérico amigable de 10 dígitos:
 ```
-Tu IP de Tailscale: 100.85.12.34  <--->  Tu ID en ODesk: 168 329 5266
++----------------------------------------------------------------------------------+
+|  ODesk [ADMINISTRADOR] • Control Total P2P       ● Conectado a Servidor WAN (AWS) |
++----------------------------------------------------------------------------------+
+|                                        |                                         |
+|  [ Este Puesto de Trabajo ]            |  [ Controlar Otro Dispositivo ]         |
+|  Comparte tu código y contraseña.      |  Introduce el ID remoto y contraseña.   |
+|                                        |                                         |
+|  +----------------------------------+  |  +-----------------------------------+  |
+|  |           Tu Código ID:          |  |  |                                   |  |
+|  |          554 839 109             |  |  |       ID Remoto: 482 919 021      |  |
+|  |   IP Pública: 179.12.128.160     |  |  |                                   |  |
+|  +----------------------------------+  |  |     Contraseña: [ * * * * * * ]   |  |
+|                                        |  +-----------------------------------+  |
+|  [ Contraseña: ******* (Ver/Guardar)]  |                                         |
+|  [      COPIAR CÓDIGO (Azul)      ]   |  [         CONECTAR (Verde)         ]   |
++----------------------------------------------------------------------------------+
 ```
-- **El video viaja 100% directo (P2P)** entre los dos equipos.
-- **Cero servidores en AWS.** No requieres bases de datos, instancias EC2 ni pagar ancho de banda en la nube.
 
 ---
 
-## 🚀 Cómo Usarlo
+## 🛠️ Compilar el Ejecutable `.exe`
 
-### 1. Iniciar la aplicación
-Simplemente ejecuta:
+Para generar o regenerar el ejecutable portátil sin consola:
 ```powershell
-python odesk.py
+.\build.bat
 ```
-*(O haz doble clic en `odesk.py`)*.
-
-### 2. Conectarte a otro equipo
-1. Pídele al usuario remoto su **Código ID** de 10 dígitos que aparece en su pantalla.
-2. Escríbelo en la casilla **Controlar Otro Dispositivo**.
-3. Haz clic en **Conectar**. Se abrirá la ventana con el escritorio remoto en tiempo real.
-
----
-
-## 🌐 Conexión por Internet (Fuera de casa) con Tailscale
-Para conectar dos ordenadores situados en distintas casas o ciudades sin abrir puertos en el router:
-1. Instala [Tailscale](https://tailscale.com/) en ambos ordenadores (es gratuito para uso personal).
-2. ODesk detectará automáticamente la interfaz de Tailscale y tu código ID cambiará al código seguro de tu red privada.
-3. Todo el tráfico viajará cifrado de extremo a extremo mediante **WireGuard**.
+Generará el archivo binario único: [`ODesk.exe`](file:///c:/Proyectos/ODesk/ODesk.exe).
