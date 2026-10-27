@@ -487,16 +487,26 @@ class HostServer:
             self.current_client_sock = None
 
     def send_file_to_client(self, file_path):
-        """Transfiere un archivo desde el Host hacia el Cliente conectado."""
+        """Transfiere un archivo desde el Host hacia el Cliente conectado (al portapapeles/descargas)."""
+        return self.send_file_to_client_with_dest(file_path, dest_dir="")
+
+    def send_file_to_client_with_dest(self, file_path, dest_dir=""):
+        """Transfiere un archivo desde el Host hacia el Cliente indicando carpeta destino."""
         if not self.current_client_sock or not os.path.exists(file_path):
             return False
         try:
             fn = os.path.basename(file_path)
             size = os.path.getsize(file_path)
             fn_b = fn.encode("utf-8")
-            self.safe_send_client(
-                b"\x08\x01" + struct.pack(">H", len(fn_b)) + fn_b + struct.pack(">Q", size)
+            dd_b = dest_dir.encode("utf-8") if dest_dir else b""
+            # Sub-acción 4: Cabecera con carpeta de destino personalizada
+            header = (
+                b"\x08\x04"
+                + struct.pack(">H", len(dd_b)) + dd_b
+                + struct.pack(">H", len(fn_b)) + fn_b
+                + struct.pack(">Q", size)
             )
+            self.safe_send_client(header)
             with open(file_path, "rb") as f:
                 while self.running and self.current_client_sock:
                     chunk = f.read(65536)
@@ -509,6 +519,79 @@ class HostServer:
             return True
         except Exception:
             return False
+
+    def get_remote_dir_listing(self, req_path=""):
+        """Lista carpetas, archivos, accesos directos y unidades en el servidor."""
+        user_home = os.path.expanduser("~")
+        common = {
+            "Descargas": os.path.join(user_home, "Downloads"),
+            "Escritorio": os.path.join(user_home, "Desktop"),
+            "Documentos": os.path.join(user_home, "Documents"),
+            "Usuario": user_home,
+        }
+        drives = []
+        for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
+            drive_str = f"{letter}:\\"
+            if os.path.exists(drive_str):
+                drives.append(drive_str)
+
+        if not req_path or req_path in ("ROOT", "DEFAULT", ""):
+            req_path = common.get("Escritorio") or "C:\\"
+
+        if not os.path.exists(req_path) or not os.path.isdir(req_path):
+            req_path = common.get("Descargas") or "C:\\"
+
+        parent = os.path.dirname(os.path.abspath(req_path))
+        if parent == req_path:
+            parent = "ROOT"
+
+        folders = []
+        files = []
+        try:
+            with os.scandir(req_path) as it:
+                for entry in it:
+                    try:
+                        name = entry.name
+                        if name.startswith("$") or name.lower().startswith("system volume"):
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            folders.append(name)
+                        elif entry.is_file(follow_symlinks=False):
+                            try:
+                                sz = entry.stat().st_size
+                            except Exception:
+                                sz = 0
+                            files.append({"name": name, "size": sz})
+                    except (PermissionError, OSError):
+                        continue
+        except (PermissionError, OSError):
+            pass
+
+        folders.sort(key=lambda s: s.lower())
+        files.sort(key=lambda s: s["name"].lower())
+
+        return {
+            "current_path": req_path,
+            "parent_path": parent,
+            "folders": folders,
+            "files": files,
+            "common": common,
+            "drives": drives,
+        }
+
+    def handle_pull_file_request(self, remote_file_path, client_dest_dir):
+        """Atiende la solicitud del cliente para descargar un archivo desde este Host."""
+        if not os.path.exists(remote_file_path) or not os.path.isfile(remote_file_path):
+            err_msg = f"El archivo no existe en el servidor: {remote_file_path}"
+            err_b = err_msg.encode("utf-8")
+            self.safe_send_client(b"\x09\x02" + struct.pack(">H", len(err_b)) + err_b)
+            return
+
+        success = self.send_file_to_client_with_dest(remote_file_path, client_dest_dir)
+        if not success:
+            err_msg = "Error al transmitir el archivo desde el servidor."
+            err_b = err_msg.encode("utf-8")
+            self.safe_send_client(b"\x09\x02" + struct.pack(">H", len(err_b)) + err_b)
 
     def capture_frame(self):
         if self.engine:
@@ -532,6 +615,8 @@ class HostServer:
     def handle_input(self, sock):
         incoming_file = None
         incoming_file_name = ""
+        is_clipboard_file = False
+        dest_path = ""
 
         while self.running:
             try:
@@ -586,6 +671,7 @@ class HostServer:
                     sub_action = sub_b[0]
 
                     if sub_action == 1:
+                        # Cabecera estándar (guarda en Descargas)
                         len_b = recv_exact(sock, 2)
                         if not len_b: break
                         nl = struct.unpack(">H", len_b)[0]
@@ -612,6 +698,45 @@ class HostServer:
                             incoming_file = open(dest_path, "wb")
                         except Exception:
                             incoming_file = None
+                        is_clipboard_file = True
+
+                    elif sub_action == 4:
+                        # Cabecera con Carpeta de Destino personalizada
+                        dlen_b = recv_exact(sock, 2)
+                        if not dlen_b: break
+                        dlen, = struct.unpack(">H", dlen_b)
+                        dest_dir_b = recv_exact(sock, dlen) if dlen > 0 else b""
+                        target_dest_dir = dest_dir_b.decode("utf-8", errors="ignore") if dest_dir_b else ""
+
+                        flen_b = recv_exact(sock, 2)
+                        if not flen_b: break
+                        flen, = struct.unpack(">H", flen_b)
+                        name_b = recv_exact(sock, flen)
+                        if not name_b: break
+                        incoming_file_name = name_b.decode("utf-8", errors="ignore")
+
+                        size_b = recv_exact(sock, 8)
+                        if not size_b: break
+                        _ = struct.unpack(">Q", size_b)[0]
+
+                        if not target_dest_dir or not os.path.isdir(target_dest_dir):
+                            target_dest_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                        try:
+                            os.makedirs(target_dest_dir, exist_ok=True)
+                        except Exception:
+                            pass
+
+                        dest_path = os.path.join(target_dest_dir, incoming_file_name)
+                        base, ext = os.path.splitext(dest_path)
+                        c = 1
+                        while os.path.exists(dest_path):
+                            dest_path = f"{base}_{c}{ext}"
+                            c += 1
+                        try:
+                            incoming_file = open(dest_path, "wb")
+                        except Exception:
+                            incoming_file = None
+                        is_clipboard_file = False
 
                     elif sub_action == 2:
                         len_b = recv_exact(sock, 4)
@@ -633,22 +758,63 @@ class HostServer:
                                 pass
                             incoming_file = None
                             try:
-                                set_clipboard_files([dest_path])
-                                self.last_sent_clip_files = [dest_path]
-                            except Exception:
-                                pass
-                            try:
                                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
                             except Exception:
                                 pass
-                            # Simular Ctrl+V en el host para pegar en la ventana activa de Windows Explorer
-                            try:
-                                user32.keybd_event(0x11, 0, 0, 0)
-                                user32.keybd_event(0x56, 0, 0, 0)
-                                user32.keybd_event(0x56, 0, 2, 0)
-                                user32.keybd_event(0x11, 0, 2, 0)
-                            except Exception:
-                                pass
+                            if is_clipboard_file:
+                                try:
+                                    set_clipboard_files([dest_path])
+                                    self.last_sent_clip_files = [dest_path]
+                                except Exception:
+                                    pass
+                                # Simular Ctrl+V solo para copia rápida del portapapeles
+                                try:
+                                    user32.keybd_event(0x11, 0, 0, 0)
+                                    user32.keybd_event(0x56, 0, 0, 0)
+                                    user32.keybd_event(0x56, 0, 2, 0)
+                                    user32.keybd_event(0x11, 0, 2, 0)
+                                except Exception:
+                                    pass
+
+                elif evt_type == 9:
+                    # Comandos de transferencia / Sistema de archivos remoto
+                    sub_b = recv_exact(sock, 1)
+                    if not sub_b: break
+                    sub_cmd = sub_b[0]
+
+                    if sub_cmd == 1:
+                        # REQ_LIST_DIR: Explorar archivos y carpetas del Servidor
+                        plen_b = recv_exact(sock, 2)
+                        if not plen_b: break
+                        plen, = struct.unpack(">H", plen_b)
+                        path_b = recv_exact(sock, plen) if plen > 0 else b""
+                        req_path = path_b.decode("utf-8", errors="ignore") if path_b else ""
+
+                        dir_data = self.get_remote_dir_listing(req_path)
+                        resp_json = json.dumps(dir_data).encode("utf-8")
+                        self.safe_send_client(
+                            b"\x09\x01" + struct.pack(">I", len(resp_json)) + resp_json
+                        )
+
+                    elif sub_cmd == 2:
+                        # REQ_PULL_FILE: Descargar archivo desde el Servidor hacia el Cliente
+                        rfp_len_b = recv_exact(sock, 2)
+                        if not rfp_len_b: break
+                        rfp_len, = struct.unpack(">H", rfp_len_b)
+                        rfp_b = recv_exact(sock, rfp_len) if rfp_len > 0 else b""
+                        remote_file_path = rfp_b.decode("utf-8", errors="ignore")
+
+                        cdd_len_b = recv_exact(sock, 2)
+                        if not cdd_len_b: break
+                        cdd_len, = struct.unpack(">H", cdd_len_b)
+                        cdd_b = recv_exact(sock, cdd_len) if cdd_len > 0 else b""
+                        client_dest_dir = cdd_b.decode("utf-8", errors="ignore")
+
+                        threading.Thread(
+                            target=self.handle_pull_file_request,
+                            args=(remote_file_path, client_dest_dir),
+                            daemon=True
+                        ).start()
 
             except Exception:
                 break
@@ -851,7 +1017,583 @@ def establish_connection_cascade(sig_client, target_code, cancel_token, update_s
     return None
 
 
-def launch_viewer(sock, password="", target_code="", on_connected=None, on_close=None, on_status_msg=None, cancel_token=None):
+def format_file_size(size_bytes):
+    try:
+        size = float(size_bytes)
+        if size < 1024:
+            return f"{int(size)} B"
+        elif size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        elif size < 1024 * 1024 * 1024:
+            return f"{size / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size / (1024 * 1024 * 1024):.2f} GB"
+    except Exception:
+        return "--"
+
+
+def open_remote_explorer_dialog(parent_win, mode, on_select_callback, request_dir_fn, register_dir_cb_fn):
+    """
+    Ventana emergente que permite navegar por el sistema de archivos del servidor remoto.
+    mode: 'file' (seleccionar archivo para descargar) o 'folder' (seleccionar carpeta de destino en servidor).
+    """
+    import customtkinter as ctk
+
+    exp_win = ctk.CTkToplevel(parent_win)
+    title_text = "Explorador Remoto - " + ("Seleccionar Archivo en Servidor" if mode == "file" else "Seleccionar Carpeta en Servidor")
+    exp_win.title(title_text)
+    exp_win.geometry("640x500")
+    exp_win.minsize(580, 440)
+    exp_win.lift()
+    exp_win.attributes("-topmost", True)
+    exp_win.focus_force()
+
+    current_data = {"path": "", "parent": "", "folders": [], "files": [], "selected_file": "", "selected_size": 0, "common": {}, "drives": []}
+
+    # Barra superior con ruta actual
+    top_bar = ctk.CTkFrame(exp_win, fg_color="transparent")
+    top_bar.pack(fill="x", padx=15, pady=(15, 5))
+
+    btn_up = ctk.CTkButton(top_bar, text="⬆️ Subir", width=70, height=32, command=lambda: on_go_up())
+    btn_up.pack(side="left", padx=(0, 6))
+
+    ent_path = ctk.CTkEntry(top_bar, height=32)
+    ent_path.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+    def on_enter_path(event=None):
+        p = ent_path.get().strip()
+        if p:
+            load_dir(p)
+
+    ent_path.bind("<Return>", on_enter_path)
+
+    btn_go = ctk.CTkButton(top_bar, text="Ir 🔄", width=60, height=32, command=on_enter_path)
+    btn_go.pack(side="left")
+
+    # Fila de accesos rápidos (Unidades y carpetas)
+    quick_bar = ctk.CTkFrame(exp_win, fg_color="transparent")
+    quick_bar.pack(fill="x", padx=15, pady=(0, 8))
+
+    lbl_quick = ctk.CTkLabel(quick_bar, text="Accesos rápidos:", font=ctk.CTkFont(size=11), text_color="#94a3b8")
+    lbl_quick.pack(side="left", padx=(0, 8))
+
+    quick_btn_container = ctk.CTkFrame(quick_bar, fg_color="transparent")
+    quick_btn_container.pack(side="left", fill="x", expand=True)
+
+    # Lista desplazable de carpetas y archivos
+    scroll_frame = ctk.CTkScrollableFrame(exp_win, height=270, fg_color="#181825")
+    scroll_frame.pack(fill="both", expand=True, padx=15, pady=(0, 8))
+
+    lbl_loading = ctk.CTkLabel(scroll_frame, text="⏳ Obteniendo carpetas y archivos del servidor...", text_color="#94a3b8")
+    lbl_loading.pack(pady=40)
+
+    # Barra inferior con elemento seleccionado y botones
+    bottom_bar = ctk.CTkFrame(exp_win, fg_color="transparent")
+    bottom_bar.pack(fill="x", padx=15, pady=(5, 15))
+
+    lbl_selected_title = ctk.CTkLabel(bottom_bar, text="Selección:", font=ctk.CTkFont(size=12, weight="bold"))
+    lbl_selected_title.pack(side="left", padx=(0, 6))
+
+    lbl_selected_val = ctk.CTkLabel(bottom_bar, text="Ninguno", font=ctk.CTkFont(size=12), text_color="#38bdf8")
+    lbl_selected_val.pack(side="left", fill="x", expand=True)
+
+    btn_cancel = ctk.CTkButton(bottom_bar, text="Cancelar", width=90, fg_color="#4b5563", hover_color="#374151", command=exp_win.destroy)
+    btn_cancel.pack(side="right", padx=(6, 0))
+
+    def on_confirm_selection():
+        if mode == "file":
+            sf = current_data.get("selected_file")
+            if not sf:
+                return
+            full_path = os.path.join(current_data["path"], sf)
+            exp_win.destroy()
+            on_select_callback(full_path, current_data.get("selected_size", 0))
+        else:
+            cp = current_data.get("path")
+            if not cp:
+                return
+            exp_win.destroy()
+            on_select_callback(cp, 0)
+
+    btn_confirm = ctk.CTkButton(
+        bottom_bar,
+        text="✅ Seleccionar " + ("Archivo" if mode == "file" else "Carpeta"),
+        width=140,
+        fg_color="#10b981",
+        hover_color="#059669",
+        font=ctk.CTkFont(weight="bold"),
+        command=on_confirm_selection
+    )
+    btn_confirm.pack(side="right")
+
+    def render_directory_contents(data):
+        if not exp_win.winfo_exists():
+            return
+        current_data["path"] = data.get("current_path", "")
+        current_data["parent"] = data.get("parent_path", "")
+        current_data["folders"] = data.get("folders", [])
+        current_data["files"] = data.get("files", [])
+        current_data["common"] = data.get("common", {})
+        current_data["drives"] = data.get("drives", [])
+
+        ent_path.delete(0, "end")
+        ent_path.insert(0, current_data["path"])
+
+        # Renderizar accesos directos
+        for w in quick_btn_container.winfo_children():
+            w.destroy()
+
+        for d in current_data["drives"]:
+            b = ctk.CTkButton(quick_btn_container, text=d, width=42, height=24, font=ctk.CTkFont(size=11), fg_color="#334155", hover_color="#475569", command=lambda p=d: load_dir(p))
+            b.pack(side="left", padx=2)
+
+        for name, p in current_data["common"].items():
+            if name in ("Descargas", "Escritorio", "Documentos"):
+                b = ctk.CTkButton(quick_btn_container, text=name, height=24, font=ctk.CTkFont(size=11), fg_color="#1e293b", hover_color="#334155", command=lambda path=p: load_dir(path))
+                b.pack(side="left", padx=2)
+
+        # Renderizar lista de carpetas y archivos
+        for w in scroll_frame.winfo_children():
+            w.destroy()
+
+        # Carpetas
+        for folder_name in current_data["folders"]:
+            f_row = ctk.CTkButton(
+                scroll_frame,
+                text=f"📁  {folder_name}",
+                anchor="w",
+                fg_color="transparent",
+                hover_color="#28283d",
+                text_color="#f1f5f9",
+                height=28,
+                command=lambda fn=folder_name: load_dir(os.path.join(current_data["path"], fn))
+            )
+            f_row.pack(fill="x", padx=4, pady=1)
+
+        # Archivos
+        for f_info in current_data["files"]:
+            fn = f_info.get("name", "")
+            sz = f_info.get("size", 0)
+            sz_str = format_file_size(sz)
+
+            def make_file_select(file_name, file_sz):
+                def select():
+                    current_data["selected_file"] = file_name
+                    current_data["selected_size"] = file_sz
+                    lbl_selected_val.configure(text=f"{file_name} ({format_file_size(file_sz)})")
+                return select
+
+            file_btn = ctk.CTkButton(
+                scroll_frame,
+                text=f"📄  {fn}    [{sz_str}]",
+                anchor="w",
+                fg_color="transparent",
+                hover_color="#1e3a8a" if mode == "file" else "#28283d",
+                text_color="#93c5fd" if mode == "file" else "#64748b",
+                height=28,
+                command=make_file_select(fn, sz) if mode == "file" else None
+            )
+            file_btn.pack(fill="x", padx=4, pady=1)
+
+        if mode == "folder":
+            lbl_selected_val.configure(text=f"📁 {current_data['path']}")
+
+    def on_go_up():
+        p = current_data.get("parent")
+        if p and p != "ROOT":
+            load_dir(p)
+
+    def load_dir(target_p):
+        for w in scroll_frame.winfo_children():
+            w.destroy()
+        lbl_load = ctk.CTkLabel(scroll_frame, text=f"⏳ Cargando: {target_p}...", text_color="#94a3b8")
+        lbl_load.pack(pady=40)
+        request_dir_fn(target_p)
+
+    def on_remote_dir_arrival(data):
+        if exp_win.winfo_exists():
+            exp_win.after(0, lambda: render_directory_contents(data))
+
+    register_dir_cb_fn(on_remote_dir_arrival)
+    request_dir_fn("")
+
+
+def open_file_transfer_dialog(gui_root, target_code, request_dir_fn, request_pull_fn, upload_fn, register_callbacks_fn):
+    """
+    Menú principal interactivo de transferencia de archivos con selección clara de Origen y Destino.
+    Permite escoger de dónde sacar el archivo (PC Cliente o PC Servidor) y dónde guardarlo (PC Servidor o PC Cliente) y en qué carpeta.
+    """
+    import customtkinter as ctk
+    from tkinter import filedialog, messagebox
+
+    top = ctk.CTkToplevel(gui_root)
+    top.title(f"ODesk - Transferencia de Archivos [{target_code}]")
+    top.geometry("700x670")
+    top.minsize(660, 620)
+    top.lift()
+    top.attributes("-topmost", True)
+    top.focus_force()
+
+    # Estado
+    src_type_var = ctk.StringVar(value="CLIENT")
+    dst_type_var = ctk.StringVar(value="SERVER")
+
+    selected_src_path = [""]
+    selected_src_size = [0]
+    selected_dst_folder = [""]
+    server_common_cache = {}
+
+    # Header
+    head_frame = ctk.CTkFrame(top, fg_color="transparent")
+    head_frame.pack(fill="x", padx=20, pady=(15, 10))
+
+    lbl_title = ctk.CTkLabel(
+        head_frame,
+        text="📁 Menú de Transferencia de Archivos",
+        font=ctk.CTkFont(size=20, weight="bold"),
+        text_color="#f8fafc"
+    )
+    lbl_title.pack(anchor="w")
+
+    lbl_desc = ctk.CTkLabel(
+        head_frame,
+        text=f"Sesión activa con [{target_code}]. Elige de dónde sacar el archivo y dónde guardarlo.",
+        font=ctk.CTkFont(size=12),
+        text_color="#94a3b8"
+    )
+    lbl_desc.pack(anchor="w", pady=(2, 0))
+
+    # ================= CARD 1: ORIGEN =================
+    card_src = ctk.CTkFrame(top, fg_color="#1e1e2e", corner_radius=10, border_width=1, border_color="#334155")
+    card_src.pack(fill="x", padx=20, pady=(0, 10))
+
+    lbl_c1_title = ctk.CTkLabel(
+        card_src,
+        text="1. Archivo de Origen (¿De dónde quieres sacar el archivo?)",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        text_color="#38bdf8"
+    )
+    lbl_c1_title.pack(anchor="w", padx=15, pady=(12, 6))
+
+    src_selector_frame = ctk.CTkFrame(card_src, fg_color="transparent")
+    src_selector_frame.pack(fill="x", padx=15, pady=(0, 8))
+
+    def on_src_radio_change():
+        st = src_type_var.get()
+        if st == "CLIENT":
+            dst_type_var.set("SERVER")
+        else:
+            dst_type_var.set("CLIENT")
+        update_ui_state()
+
+    rb_src_client = ctk.CTkRadioButton(
+        src_selector_frame,
+        text="💻 PC Cliente (Mi equipo local)",
+        variable=src_type_var,
+        value="CLIENT",
+        command=on_src_radio_change,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        fg_color="#3b82f6"
+    )
+    rb_src_client.pack(side="left", padx=(0, 25))
+
+    rb_src_server = ctk.CTkRadioButton(
+        src_selector_frame,
+        text="🖥️ PC Servidor (Equipo remoto)",
+        variable=src_type_var,
+        value="SERVER",
+        command=on_src_radio_change,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        fg_color="#3b82f6"
+    )
+    rb_src_server.pack(side="left")
+
+    src_file_row = ctk.CTkFrame(card_src, fg_color="transparent")
+    src_file_row.pack(fill="x", padx=15, pady=(0, 4))
+
+    ent_src_file = ctk.CTkEntry(src_file_row, placeholder_text="Ningún archivo seleccionado...", height=34)
+    ent_src_file.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    btn_browse_src = ctk.CTkButton(src_file_row, text="📂 Examinar...", width=150, height=34, font=ctk.CTkFont(weight="bold"))
+    btn_browse_src.pack(side="right")
+
+    src_info_row = ctk.CTkFrame(card_src, fg_color="transparent")
+    src_info_row.pack(fill="x", padx=15, pady=(0, 10))
+
+    lbl_src_size = ctk.CTkLabel(src_info_row, text="Tamaño: --", font=ctk.CTkFont(size=12), text_color="#94a3b8")
+    lbl_src_size.pack(side="left")
+
+    # ================= CARD 2: DESTINO =================
+    card_dst = ctk.CTkFrame(top, fg_color="#1e1e2e", corner_radius=10, border_width=1, border_color="#334155")
+    card_dst.pack(fill="x", padx=20, pady=(0, 10))
+
+    lbl_c2_title = ctk.CTkLabel(
+        card_dst,
+        text="2. Archivo Destino y Carpeta (¿Dónde quieres guardarlo?)",
+        font=ctk.CTkFont(size=14, weight="bold"),
+        text_color="#10b981"
+    )
+    lbl_c2_title.pack(anchor="w", padx=15, pady=(12, 6))
+
+    dst_selector_frame = ctk.CTkFrame(card_dst, fg_color="transparent")
+    dst_selector_frame.pack(fill="x", padx=15, pady=(0, 8))
+
+    def on_dst_radio_change():
+        dt = dst_type_var.get()
+        if dt == "SERVER":
+            src_type_var.set("CLIENT")
+        else:
+            src_type_var.set("SERVER")
+        update_ui_state()
+
+    rb_dst_server = ctk.CTkRadioButton(
+        dst_selector_frame,
+        text="🖥️ PC Servidor (Equipo remoto)",
+        variable=dst_type_var,
+        value="SERVER",
+        command=on_dst_radio_change,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        fg_color="#10b981"
+    )
+    rb_dst_server.pack(side="left", padx=(0, 25))
+
+    rb_dst_client = ctk.CTkRadioButton(
+        dst_selector_frame,
+        text="💻 PC Cliente (Mi equipo local)",
+        variable=dst_type_var,
+        value="CLIENT",
+        command=on_dst_radio_change,
+        font=ctk.CTkFont(size=13, weight="bold"),
+        fg_color="#10b981"
+    )
+    rb_dst_client.pack(side="left")
+
+    dst_folder_row = ctk.CTkFrame(card_dst, fg_color="transparent")
+    dst_folder_row.pack(fill="x", padx=15, pady=(0, 4))
+
+    ent_dst_folder = ctk.CTkEntry(dst_folder_row, placeholder_text="Carpeta de destino donde se guardará...", height=34)
+    ent_dst_folder.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+    btn_browse_dst = ctk.CTkButton(dst_folder_row, text="📁 Elegir Carpeta...", width=150, height=34, font=ctk.CTkFont(weight="bold"))
+    btn_browse_dst.pack(side="right")
+
+    dst_quick_row = ctk.CTkFrame(card_dst, fg_color="transparent")
+    dst_quick_row.pack(fill="x", padx=15, pady=(2, 10))
+
+    lbl_dst_quick = ctk.CTkLabel(dst_quick_row, text="Carpetas rápidas:", font=ctk.CTkFont(size=11), text_color="#94a3b8")
+    lbl_dst_quick.pack(side="left", padx=(0, 6))
+
+    chip_container = ctk.CTkFrame(dst_quick_row, fg_color="transparent")
+    chip_container.pack(side="left", fill="x", expand=True)
+
+    # ================= CARD 3: ACCIÓN Y PROGRESO =================
+    card_act = ctk.CTkFrame(top, fg_color="#1e1e2e", corner_radius=10, border_width=1, border_color="#334155")
+    card_act.pack(fill="x", padx=20, pady=(0, 15))
+
+    btn_start = ctk.CTkButton(
+        card_act,
+        text="🚀 Iniciar Transferencia de Archivo",
+        height=42,
+        font=ctk.CTkFont(size=15, weight="bold"),
+        fg_color="#10b981",
+        hover_color="#059669"
+    )
+    btn_start.pack(fill="x", padx=15, pady=(15, 10))
+
+    prog_bar = ctk.CTkProgressBar(card_act, height=12)
+    prog_bar.set(0)
+    prog_bar.pack(fill="x", padx=15, pady=(0, 8))
+
+    lbl_status = ctk.CTkLabel(
+        card_act,
+        text="Listo para transferir. Selecciona el archivo de origen y la carpeta destino.",
+        font=ctk.CTkFont(size=12),
+        text_color="#94a3b8"
+    )
+    lbl_status.pack(padx=15, pady=(0, 12))
+
+    btn_close = ctk.CTkButton(top, text="Cerrar", width=100, height=32, fg_color="#475569", hover_color="#334155", command=top.destroy)
+    btn_close.pack(anchor="e", padx=20, pady=(0, 10))
+
+    def set_dst_path(folder_path):
+        selected_dst_folder[0] = folder_path
+        ent_dst_folder.delete(0, "end")
+        ent_dst_folder.insert(0, folder_path)
+
+    def set_src_path(file_path, file_size=0):
+        selected_src_path[0] = file_path
+        ent_src_file.delete(0, "end")
+        ent_src_file.insert(0, file_path)
+        if file_size > 0:
+            selected_src_size[0] = file_size
+            lbl_src_size.configure(text=f"Tamaño: {format_file_size(file_size)}")
+        elif os.path.exists(file_path) and os.path.isfile(file_path):
+            sz = os.path.getsize(file_path)
+            selected_src_size[0] = sz
+            lbl_src_size.configure(text=f"Tamaño: {format_file_size(sz)}")
+        else:
+            lbl_src_size.configure(text="Tamaño: --")
+
+    def on_browse_src_clicked():
+        st = src_type_var.get()
+        if st == "CLIENT":
+            fn = filedialog.askopenfilename(parent=top, title="Seleccionar archivo en este equipo local")
+            if fn:
+                set_src_path(fn)
+        else:
+            open_remote_explorer_dialog(
+                parent_win=top,
+                mode="file",
+                on_select_callback=lambda fp, sz: set_src_path(fp, sz),
+                request_dir_fn=request_dir_fn,
+                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb)
+            )
+
+    def on_browse_dst_clicked():
+        dt = dst_type_var.get()
+        if dt == "CLIENT":
+            d = filedialog.askdirectory(parent=top, title="Seleccionar carpeta donde guardar en este equipo local")
+            if d:
+                set_dst_path(d)
+        else:
+            open_remote_explorer_dialog(
+                parent_win=top,
+                mode="folder",
+                on_select_callback=lambda dp, _: set_dst_path(dp),
+                request_dir_fn=request_dir_fn,
+                register_dir_cb_fn=lambda cb: register_callbacks_fn(dir_cb=cb)
+            )
+
+    btn_browse_src.configure(command=on_browse_src_clicked)
+    btn_browse_dst.configure(command=on_browse_dst_clicked)
+
+    def update_ui_state():
+        st = src_type_var.get()
+
+        for w in chip_container.winfo_children():
+            w.destroy()
+
+        if st == "CLIENT":
+            btn_browse_src.configure(text="📂 Examinar mi PC...", fg_color="#2563eb", hover_color="#1d4ed8")
+            btn_browse_dst.configure(text="🔍 Explorar Servidor...", fg_color="#059669", hover_color="#047857")
+
+            def make_server_chip(name):
+                def pick():
+                    p = server_common_cache.get(name, "")
+                    if p:
+                        set_dst_path(p)
+                    else:
+                        set_dst_path(name)
+                return pick
+
+            for c_name in ("Descargas", "Escritorio", "Documentos"):
+                btn_chip = ctk.CTkButton(chip_container, text=c_name, height=24, font=ctk.CTkFont(size=11), fg_color="#334155", hover_color="#475569", command=make_server_chip(c_name))
+                btn_chip.pack(side="left", padx=2)
+
+            if not selected_dst_folder[0]:
+                default_serv = server_common_cache.get("Descargas") or server_common_cache.get("Escritorio") or "Descargas"
+                set_dst_path(default_serv)
+
+        else:
+            btn_browse_src.configure(text="🔍 Explorar Servidor...", fg_color="#059669", hover_color="#047857")
+            btn_browse_dst.configure(text="📁 Elegir Carpeta...", fg_color="#2563eb", hover_color="#1d4ed8")
+
+            local_user = os.path.expanduser("~")
+            local_common = {
+                "Descargas": os.path.join(local_user, "Downloads"),
+                "Escritorio": os.path.join(local_user, "Desktop"),
+                "Documentos": os.path.join(local_user, "Documents")
+            }
+            for c_name, c_path in local_common.items():
+                btn_chip = ctk.CTkButton(chip_container, text=c_name, height=24, font=ctk.CTkFont(size=11), fg_color="#334155", hover_color="#475569", command=lambda p=c_path: set_dst_path(p))
+                btn_chip.pack(side="left", padx=2)
+
+            if not selected_dst_folder[0] or selected_dst_folder[0] in server_common_cache.values():
+                set_dst_path(local_common["Descargas"])
+
+    def on_initial_dir_info(dir_data):
+        if not top.winfo_exists():
+            return
+        common = dir_data.get("common", {})
+        if common:
+            server_common_cache.update(common)
+            if src_type_var.get() == "CLIENT" and ent_dst_folder.get() in ("Descargas", ""):
+                top.after(0, lambda: set_dst_path(common.get("Descargas") or common.get("Escritorio", "")))
+
+    register_callbacks_fn(dir_cb=on_initial_dir_info)
+    request_dir_fn("")
+
+    def on_transfer_progress(sent_or_recv, total, fn):
+        if not top.winfo_exists():
+            return
+        pct = (sent_or_recv / max(1, total)) if total > 0 else 0
+        top.after(0, lambda: (
+            prog_bar.set(pct),
+            lbl_status.configure(
+                text=f"Transfiriendo: {fn} ({format_file_size(sent_or_recv)} / {format_file_size(total)} - {int(pct * 100)}%)...",
+                text_color="#38bdf8"
+            )
+        ))
+
+    def on_transfer_done(dest_path_result, success, message):
+        if not top.winfo_exists():
+            return
+        top.after(0, lambda: (
+            prog_bar.set(1.0),
+            lbl_status.configure(text=f"✅ {message}", text_color="#10b981"),
+            btn_start.configure(state="normal", text="🚀 Iniciar Transferencia de Archivo")
+        ))
+
+    def on_transfer_error(err_msg):
+        if not top.winfo_exists():
+            return
+        top.after(0, lambda: (
+            lbl_status.configure(text=f"❌ Error: {err_msg}", text_color="#ef4444"),
+            btn_start.configure(state="normal", text="🚀 Iniciar Transferencia de Archivo"),
+            messagebox.showerror("Error en Transferencia", err_msg, parent=top)
+        ))
+
+    register_callbacks_fn(
+        prog_cb=on_transfer_progress,
+        done_cb=on_transfer_done,
+        err_cb=on_transfer_error
+    )
+
+    def on_start_transfer_clicked():
+        src_file = ent_src_file.get().strip()
+        dst_folder = ent_dst_folder.get().strip()
+
+        if not src_file:
+            messagebox.showwarning("Atención", "Por favor selecciona el archivo de origen a transferir.", parent=top)
+            return
+        if not dst_folder:
+            messagebox.showwarning("Atención", "Por favor selecciona o escribe la carpeta de destino.", parent=top)
+            return
+
+        st = src_type_var.get()
+        btn_start.configure(state="disabled", text="⏳ Transfiriendo...")
+        prog_bar.set(0)
+        lbl_status.configure(text="Iniciando transferencia...", text_color="#94a3b8")
+
+        if st == "CLIENT":
+            if not os.path.exists(src_file) or not os.path.isfile(src_file):
+                btn_start.configure(state="normal", text="🚀 Iniciar Transferencia de Archivo")
+                messagebox.showerror("Error", f"El archivo local no existe o no se puede leer:\n{src_file}", parent=top)
+                return
+
+            threading.Thread(
+                target=upload_fn,
+                args=(src_file, dst_folder, on_transfer_progress, on_transfer_done, on_transfer_error),
+                daemon=True
+            ).start()
+        else:
+            request_pull_fn(src_file, dst_folder)
+
+    btn_start.configure(command=on_start_transfer_clicked)
+    update_ui_state()
+
+
+def launch_viewer(sock, password="", target_code="", on_connected=None, on_close=None, on_status_msg=None, cancel_token=None, gui_root=None):
     import pygame
     from tkinter import filedialog
     import tkinter as tk
@@ -934,6 +1676,18 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
         running = True
         last_local_clip = ""
 
+        # Callbacks y estado para el Menú de Transferencia de Archivos
+        active_dir_cb = [None]
+        active_prog_cb = [None]
+        active_done_cb = [None]
+        active_err_cb = [None]
+
+        def register_ft_callbacks(dir_cb=None, prog_cb=None, done_cb=None, err_cb=None):
+            if dir_cb: active_dir_cb[0] = dir_cb
+            if prog_cb: active_prog_cb[0] = prog_cb
+            if done_cb: active_done_cb[0] = done_cb
+            if err_cb: active_err_cb[0] = err_cb
+
         # Candado atómico para envíos por socket (evita entrelazado con movimientos de ratón)
         sock_send_lock = threading.Lock()
 
@@ -944,6 +1698,69 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     return True
                 except Exception:
                     return False
+
+        def send_dir_request(path=""):
+            pb = path.encode("utf-8") if path else b""
+            safe_send(b"\x09\x01" + struct.pack(">H", len(pb)) + pb)
+
+        def send_pull_request(remote_file, local_folder):
+            rfp_b = remote_file.encode("utf-8")
+            ldd_b = local_folder.encode("utf-8") if local_folder else b""
+            safe_send(
+                b"\x09\x02"
+                + struct.pack(">H", len(rfp_b)) + rfp_b
+                + struct.pack(">H", len(ldd_b)) + ldd_b
+            )
+
+        def send_upload_file(local_file, remote_folder, on_prog, on_done, on_err):
+            try:
+                fn = os.path.basename(local_file)
+                total_size = os.path.getsize(local_file)
+                fn_b = fn.encode("utf-8")
+                rdd_b = remote_folder.encode("utf-8") if remote_folder else b""
+
+                header = (
+                    b"\x08\x04"
+                    + struct.pack(">H", len(rdd_b)) + rdd_b
+                    + struct.pack(">H", len(fn_b)) + fn_b
+                    + struct.pack(">Q", total_size)
+                )
+                if not safe_send(header):
+                    on_err("Error de conexión al enviar cabecera al servidor.")
+                    return
+
+                sent_bytes = 0
+                with open(local_file, "rb") as f:
+                    while running:
+                        chunk = f.read(65536)
+                        if not chunk:
+                            break
+                        if not safe_send(b"\x08\x02" + struct.pack(">I", len(chunk)) + chunk):
+                            on_err("Error de conexión durante el envío del archivo.")
+                            return
+                        sent_bytes += len(chunk)
+                        on_prog(sent_bytes, total_size, fn)
+                        time.sleep(0.001)
+
+                safe_send(b"\x08\x03")
+                on_done(remote_folder, True, f"¡Archivo '{fn}' subido con éxito al servidor en:\n{remote_folder}!")
+            except Exception as e:
+                on_err(f"Error al leer o enviar archivo: {e}")
+
+        def trigger_open_transfer_dialog():
+            if not gui_root:
+                pick_and_send()
+                return
+            def _open():
+                open_file_transfer_dialog(
+                    gui_root=gui_root,
+                    target_code=target_code,
+                    request_dir_fn=send_dir_request,
+                    request_pull_fn=send_pull_request,
+                    upload_fn=send_upload_file,
+                    register_callbacks_fn=register_ft_callbacks
+                )
+            gui_root.after(0, _open)
 
         # Cola de transferencia secuencial de archivos (Cliente -> Servidor)
         file_send_queue = []
@@ -1019,6 +1836,8 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
             c_inc_file = None
             c_dest = ""
             inc_fn = ""
+            inc_total_size = 0
+            inc_bytes_received = 0
 
             while running:
                 pkt_type = recv_exact(sock, 1)
@@ -1051,7 +1870,15 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                     if not sub_b: break
                     sub_action = sub_b[0]
 
-                    if sub_action == 1:
+                    if sub_action in (1, 4):
+                        custom_target_dir = ""
+                        if sub_action == 4:
+                            dlen_b = recv_exact(sock, 2)
+                            if not dlen_b: break
+                            dlen, = struct.unpack(">H", dlen_b)
+                            db = recv_exact(sock, dlen) if dlen > 0 else b""
+                            custom_target_dir = db.decode("utf-8", errors="ignore") if db else ""
+
                         len_b = recv_exact(sock, 2)
                         if not len_b: break
                         nl = struct.unpack(">H", len_b)[0]
@@ -1061,12 +1888,15 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
                         size_b = recv_exact(sock, 8)
                         if not size_b: break
-                        _ = struct.unpack(">Q", size_b)[0]
+                        inc_total_size = struct.unpack(">Q", size_b)[0]
+                        inc_bytes_received = 0
 
-                        d_dir = os.path.join(os.path.expanduser("~"), "Downloads")
-                        try: os.makedirs(d_dir, exist_ok=True)
+                        if not custom_target_dir or not os.path.isdir(custom_target_dir):
+                            custom_target_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+                        try: os.makedirs(custom_target_dir, exist_ok=True)
                         except Exception: pass
-                        c_dest = os.path.join(d_dir, inc_fn)
+
+                        c_dest = os.path.join(custom_target_dir, inc_fn)
                         base, ext = os.path.splitext(c_dest)
                         c = 1
                         while os.path.exists(c_dest):
@@ -1077,7 +1907,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                         except Exception:
                             c_inc_file = None
                         with lock:
-                            transfer_status_msg = f"Copiando archivo del servidor: {inc_fn}..."
+                            transfer_status_msg = f"Recibiendo archivo del servidor: {inc_fn}..."
                             transfer_msg_timer = time.time() + 6.0
 
                     elif sub_action == 2:
@@ -1091,6 +1921,12 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                                 c_inc_file.write(c_chunk)
                             except Exception:
                                 pass
+                        inc_bytes_received += len(c_chunk)
+                        if active_prog_cb[0]:
+                            try:
+                                active_prog_cb[0](inc_bytes_received, inc_total_size, inc_fn)
+                            except Exception:
+                                pass
 
                     elif sub_action == 3:
                         if c_inc_file:
@@ -1100,16 +1936,47 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                                 pass
                             c_inc_file = None
                             try:
-                                set_clipboard_files([c_dest])
-                            except Exception:
-                                pass
-                            try:
                                 winsound.MessageBeep(winsound.MB_ICONASTERISK)
                             except Exception:
                                 pass
                             with lock:
-                                transfer_status_msg = f"📋 ¡Archivo copiado del servidor!: {inc_fn} (Listo para Pegar en tu PC)"
+                                transfer_status_msg = f"¡Archivo guardado con éxito!: {inc_fn}"
                                 transfer_msg_timer = time.time() + 6.0
+                            if active_done_cb[0]:
+                                try:
+                                    active_done_cb[0](c_dest, True, f"¡Archivo descargado y guardado con éxito en:\n{c_dest}!")
+                                except Exception:
+                                    pass
+
+                elif pkt_type == b"\x09":  # Comandos de sistema de archivos / transferencia
+                    sub_b = recv_exact(sock, 1)
+                    if not sub_b: break
+                    sub_cmd = sub_b[0]
+
+                    if sub_cmd == 1:
+                        # Respuesta JSON a listado de directorio remoto
+                        len_b = recv_exact(sock, 4)
+                        if not len_b: break
+                        jlen, = struct.unpack(">I", len_b)
+                        jbytes = recv_exact(sock, jlen) if jlen > 0 else b""
+                        if jbytes:
+                            try:
+                                dir_info = json.loads(jbytes.decode("utf-8"))
+                                if active_dir_cb[0]:
+                                    active_dir_cb[0](dir_info)
+                            except Exception:
+                                pass
+
+                    elif sub_cmd == 2:
+                        # Mensaje de error del servidor remoto
+                        len_b = recv_exact(sock, 2)
+                        if not len_b: break
+                        elen, = struct.unpack(">H", len_b)
+                        ebytes = recv_exact(sock, elen) if elen > 0 else b""
+                        if ebytes:
+                            err_text = ebytes.decode("utf-8", errors="ignore")
+                            if active_err_cb[0]:
+                                active_err_cb[0](err_text)
 
             if c_inc_file:
                 try: c_inc_file.close()
@@ -1148,7 +2015,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
         font_bar = pygame.font.SysFont("Segoe UI", 12, bold=True)
         font_badge = pygame.font.SysFont("Segoe UI", 13, bold=True)
 
-        tb_w, tb_h = 470, 32
+        tb_w, tb_h = 510, 32
         tb_y = 6
 
         while running:
@@ -1158,8 +2025,8 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
             tb_x = (cur_w - tb_w) // 2
             tb_rect = pygame.Rect(tb_x, tb_y, tb_w, tb_h)
-            btn_send_rect = pygame.Rect(tb_x + 195, tb_y + 3, 155, 26)
-            btn_exit_rect = pygame.Rect(tb_x + 358, tb_y + 3, 104, 26)
+            btn_send_rect = pygame.Rect(tb_x + 175, tb_y + 3, 205, 26)
+            btn_exit_rect = pygame.Rect(tb_x + 390, tb_y + 3, 110, 26)
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1172,7 +2039,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
                 elif event.type == pygame.KEYDOWN:
                     if event.key == pygame.K_F2:
-                        threading.Thread(target=pick_and_send, daemon=True).start()
+                        trigger_open_transfer_dialog()
                         continue
                     elif event.key == pygame.K_v and (pygame.key.get_mods() & pygame.KMOD_CTRL):
                         # Detectar si hay archivos en el portapapeles local de Windows
@@ -1185,7 +2052,7 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if tb_rect.collidepoint(event.pos):
                         if btn_send_rect.collidepoint(event.pos):
-                            threading.Thread(target=pick_and_send, daemon=True).start()
+                            trigger_open_transfer_dialog()
                         elif btn_exit_rect.collidepoint(event.pos):
                             running = False
                             break
@@ -1246,11 +2113,13 @@ def launch_viewer(sock, password="", target_code="", on_connected=None, on_close
 
                 s_hover = btn_send_rect.collidepoint(m_pos)
                 pygame.draw.rect(screen, (37, 99, 235) if not s_hover else (29, 78, 216), btn_send_rect, border_radius=5)
-                lbl_btn_s = font_bar.render("📁 Enviar Archivos (F2)", True, (255, 255, 255))
+                lbl_btn_s = font_bar.render("📁 Transferir Archivos (F2)", True, (255, 255, 255))
                 screen.blit(lbl_btn_s, (btn_send_rect.x + (btn_send_rect.w - lbl_btn_s.get_width()) // 2, btn_send_rect.y + 5))
 
                 e_hover = btn_exit_rect.collidepoint(m_pos)
                 pygame.draw.rect(screen, (239, 68, 68) if not e_hover else (220, 38, 38), btn_exit_rect, border_radius=5)
+                lbl_btn_e = font_bar.render("❌ Desconectar", True, (255, 255, 255))
+                screen.blit(lbl_btn_e, (btn_exit_rect.x + (btn_exit_rect.w - lbl_btn_e.get_width()) // 2, btn_exit_rect.y + 5))
                 lbl_btn_e = font_bar.render("❌ Desconectar", True, (255, 255, 255))
                 screen.blit(lbl_btn_e, (btn_exit_rect.x + (btn_exit_rect.w - lbl_btn_e.get_width()) // 2, btn_exit_rect.y + 5))
 
@@ -1973,6 +2842,7 @@ def run_gui():
                 on_close=on_viewer_close,
                 on_status_msg=update_status_txt,
                 cancel_token=active_cancel_token,
+                gui_root=root,
             )
 
         threading.Thread(target=resolve_and_connect, daemon=True).start()
